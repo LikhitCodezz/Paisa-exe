@@ -1,0 +1,12 @@
+{
+  "name": "paisa-exe",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Paisa.exe shared web and Android app",
+  "scripts": {
+    "build": "node scripts/copy-web.mjs",
+    "android:sync": "node scripts/copy-android.mjs",
+    "android:build": "node scripts/copy-android.mjs"
+  },
+  "dependencies": {}
+}
