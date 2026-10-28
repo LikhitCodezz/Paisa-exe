@@ -5,6 +5,20 @@ import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+class AllowanceCycle {
+  const AllowanceCycle({
+    required this.isPayday,
+    required this.progress,
+    required this.daysUntil,
+    required this.payday,
+  });
+
+  final bool isPayday;
+  final double progress;
+  final int daysUntil;
+  final DateTime payday;
+}
+
 /// The single local source of truth for Paisa. No account or network is needed.
 class PaisaStore extends ChangeNotifier {
   static const _storageKey = 'paisa_flutter_ledger_v1';
@@ -221,18 +235,71 @@ class PaisaStore extends ChangeNotifier {
   int get daysRemaining =>
       DateTime(today.year, today.month + 1, 0).day - today.day + 1;
 
-  int get daysUntilPocketMoney {
-    if (recurringIncome['enabled'] == true &&
-        '${recurringIncome['nextDate']}'.isNotEmpty) {
-      final next = DateTime.tryParse('${recurringIncome['nextDate']}');
-      if (next != null)
-        return next
-            .difference(DateTime(today.year, today.month, today.day))
-            .inDays
-            .clamp(0, 365)
-            .toInt();
+  int get daysUntilPocketMoney =>
+      allowanceCycle(today, recurringIncome).daysUntil;
+
+  static AllowanceCycle allowanceCycle(
+    DateTime value,
+    Map<String, dynamic> schedule,
+  ) {
+    final date = DateTime(value.year, value.month, value.day);
+    if (schedule['enabled'] != true) {
+      final nextMonth = DateTime(date.year, date.month + 1, 1);
+      final monthDays = nextMonth
+          .difference(DateTime(date.year, date.month, 1))
+          .inDays;
+      return AllowanceCycle(
+        isPayday: false,
+        progress: (date.day - 1) / (monthDays - 1),
+        daysUntil: nextMonth.difference(date).inDays,
+        payday: nextMonth,
+      );
     }
-    return daysRemaining.clamp(1, 31).toInt();
+
+    final frequency = '${schedule['frequency'] ?? 'monthly'}';
+    if (frequency == 'weekly' || frequency == 'fortnightly') {
+      final anchor = DateTime.tryParse('${schedule['nextDate']}');
+      if (anchor != null) {
+        final interval = frequency == 'weekly' ? 7 : 14;
+        final anchorDay = DateTime(anchor.year, anchor.month, anchor.day);
+        final delta = date.difference(anchorDay).inDays;
+        final elapsed = ((delta % interval) + interval) % interval;
+        final isPayday = elapsed == 0;
+        final daysUntil = isPayday ? 0 : interval - elapsed;
+        return AllowanceCycle(
+          isPayday: isPayday,
+          progress: isPayday ? 0 : (elapsed / (interval - 1)).clamp(0.0, 1.0),
+          daysUntil: daysUntil,
+          payday: date.add(Duration(days: daysUntil)),
+        );
+      }
+    }
+
+    final storedNext = DateTime.tryParse('${schedule['nextDate']}');
+    final anchorDay = schedule['anchorDay'] is num
+        ? (schedule['anchorDay'] as num).round().clamp(1, 31).toInt()
+        : storedNext?.day ?? 1;
+    DateTime paydayIn(int year, int month) {
+      final monthDays = DateTime(year, month + 1, 0).day;
+      return DateTime(year, month, anchorDay.clamp(1, monthDays).toInt());
+    }
+
+    final thisMonth = paydayIn(date.year, date.month);
+    final isPayday = date == thisMonth;
+    final previousPayday = date.isBefore(thisMonth)
+        ? paydayIn(date.year, date.month - 1)
+        : thisMonth;
+    final nextPayday = date.isBefore(thisMonth)
+        ? thisMonth
+        : paydayIn(date.year, date.month + 1);
+    final cycleDays = nextPayday.difference(previousPayday).inDays;
+    final elapsed = date.difference(previousPayday).inDays;
+    return AllowanceCycle(
+      isPayday: isPayday,
+      progress: isPayday ? 0 : (elapsed / (cycleDays - 1)).clamp(0.0, 1.0),
+      daysUntil: isPayday ? 0 : nextPayday.difference(date).inDays,
+      payday: isPayday ? thisMonth : nextPayday,
+    );
   }
 
   List<Map<String, dynamic>> get monthTransactions => transactions.where((t) {

@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' show FontFeature, ImageFilter;
+import 'dart:ui' as ui show TextDirection;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -70,9 +71,12 @@ class _SensitiveValue extends StatelessWidget {
     final displayMode = store?.privacyStyle ?? privacyStyle ?? 'blur';
     if (!isHidden) return child;
     if (displayMode == 'blur') {
-      return ClipRect(
-        child: ImageFiltered(
-          imageFilter: ImageFilter.blur(sigmaX: 6, sigmaY: 6),
+      return ImageFiltered(
+        imageFilter: ImageFilter.blur(sigmaX: 6, sigmaY: 6),
+        child: Padding(
+          // Give the blur kernel room to fade past the glyph edges instead of
+          // cutting it off at a hard rectangular clip.
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
           child: ExcludeSemantics(child: child),
         ),
       );
@@ -84,83 +88,6 @@ class _SensitiveValue extends StatelessWidget {
 String dayLabel(DateTime date) => DateFormat('EEE · d MMM').format(date);
 String dateLabel(DateTime date) => DateFormat('dd MMM yyyy').format(date);
 String isoDay(DateTime date) => DateFormat('yyyy-MM-dd').format(date);
-
-class _AllowanceCycle {
-  const _AllowanceCycle({
-    required this.isPayday,
-    required this.progress,
-    required this.daysUntil,
-    required this.payday,
-  });
-
-  final bool isPayday;
-  final double progress;
-  final int daysUntil;
-  final DateTime payday;
-}
-
-_AllowanceCycle _allowanceCycle(DateTime value, Map<String, dynamic> schedule) {
-  final date = DateTime(value.year, value.month, value.day);
-  if (schedule['enabled'] != true) {
-    final nextMonth = DateTime(date.year, date.month + 1, 1);
-    final monthDays = nextMonth
-        .difference(DateTime(date.year, date.month, 1))
-        .inDays;
-    return _AllowanceCycle(
-      isPayday: false,
-      progress: (date.day - 1) / math.max(1, monthDays - 1),
-      daysUntil: nextMonth.difference(date).inDays,
-      payday: nextMonth,
-    );
-  }
-
-  final frequency = '${schedule['frequency'] ?? 'monthly'}';
-  if (frequency == 'weekly' || frequency == 'fortnightly') {
-    final anchor = DateTime.tryParse('${schedule['nextDate']}');
-    if (anchor != null) {
-      final interval = frequency == 'weekly' ? 7 : 14;
-      final delta = date
-          .difference(DateTime(anchor.year, anchor.month, anchor.day))
-          .inDays;
-      final elapsed = ((delta % interval) + interval) % interval;
-      final isPayday = elapsed == 0;
-      return _AllowanceCycle(
-        isPayday: isPayday,
-        progress: isPayday ? 0 : (elapsed / (interval - 1)).clamp(0.0, 1.0),
-        daysUntil: isPayday ? 0 : interval - elapsed,
-        payday: date.add(Duration(days: isPayday ? 0 : interval - elapsed)),
-      );
-    }
-  }
-
-  final storedNext = DateTime.tryParse('${schedule['nextDate']}');
-  final anchorDay = schedule['anchorDay'] is num
-      ? (schedule['anchorDay'] as num).round().clamp(1, 31).toInt()
-      : storedNext?.day ?? 1;
-  DateTime paydayIn(int year, int month) {
-    final monthDays = DateTime(year, month + 1, 0).day;
-    return DateTime(year, month, math.min(anchorDay, monthDays));
-  }
-
-  final thisMonth = paydayIn(date.year, date.month);
-  final isPayday = date == thisMonth;
-  final previousPayday = date.isBefore(thisMonth)
-      ? paydayIn(date.year, date.month - 1)
-      : thisMonth;
-  final nextPayday = date.isBefore(thisMonth)
-      ? thisMonth
-      : paydayIn(date.year, date.month + 1);
-  final cycleDays = nextPayday.difference(previousPayday).inDays;
-  final elapsed = date.difference(previousPayday).inDays;
-  return _AllowanceCycle(
-    isPayday: isPayday,
-    progress: isPayday
-        ? 0
-        : (elapsed / math.max(1, cycleDays - 1)).clamp(0.0, 1.0),
-    daysUntil: isPayday ? 0 : nextPayday.difference(date).inDays,
-    payday: isPayday ? thisMonth : nextPayday,
-  );
-}
 
 String categoryIcon(String category) =>
     const {
@@ -298,7 +225,7 @@ class _SplashSequenceState extends State<SplashSequence>
   @override
   void initState() {
     super.initState();
-    _payday = _allowanceCycle(
+    _payday = PaisaStore.allowanceCycle(
       DateTime.now(),
       widget.store.recurringIncome,
     ).isPayday;
@@ -1259,7 +1186,7 @@ class HomeScreen extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const _Eyebrow('CURRENT BALANCE'),
+              const _Eyebrow('POCKET'),
               const SizedBox(height: 9),
               _SensitiveValue(
                 store: store,
@@ -3390,7 +3317,7 @@ class _WalletScreenState extends State<_WalletScreen>
                 : null;
             final monthLength = DateTime(date.year, date.month + 1, 0).day;
             final monthDaysLeft = monthLength - date.day;
-            final allowance = _allowanceCycle(
+            final allowance = PaisaStore.allowanceCycle(
               date,
               widget.store.recurringIncome,
             );
@@ -3403,6 +3330,29 @@ class _WalletScreenState extends State<_WalletScreen>
             final amount = PaisaStore.numberForUi(
               widget.store.recurringIncome['amount'],
             );
+            final monthIncome = widget.store.total(
+              'income',
+              widget.store.monthTransactions,
+            );
+            final scheduledPocket =
+                widget.store.recurringIncome['enabled'] == true && amount > 0
+                ? amount
+                : 0.0;
+            final pocketReference = scheduledPocket > 0
+                ? scheduledPocket
+                : monthIncome > 0
+                ? monthIncome
+                : widget.store.monthlyIncome;
+            final pocketReferenceLabel = scheduledPocket > 0
+                ? 'scheduled pocket money'
+                : monthIncome > 0
+                ? 'income logged this month'
+                : 'monthly income plan';
+            final pocketFraction = pocketReference > 0
+                ? (widget.store.balance / pocketReference)
+                      .clamp(0.0, 1.0)
+                      .toDouble()
+                : 0.0;
             final isPayday = allowance.isPayday;
             final arrivalLine = isPayday
                 ? 'Pocket money day. Your next cycle starts here.'
@@ -3444,9 +3394,10 @@ class _WalletScreenState extends State<_WalletScreen>
                     ),
                   ),
                   const SizedBox(height: 2),
-                  _WalletHero(
+                  _WalletMoneyFrames(
                     arrival: _arrival,
-                    progress: progressValue,
+                    balanceFraction: pocketFraction,
+                    referenceLabel: pocketReferenceLabel,
                     isPayday: isPayday,
                     reduceMotion: widget.store.reduceMotion,
                   ),
@@ -3564,223 +3515,392 @@ class _WalletScreenState extends State<_WalletScreen>
   }
 }
 
-class _WalletHero extends StatelessWidget {
-  const _WalletHero({
+class _WalletMoneyFrames extends StatelessWidget {
+  const _WalletMoneyFrames({
     required this.arrival,
-    required this.progress,
+    required this.balanceFraction,
+    required this.referenceLabel,
     required this.isPayday,
     required this.reduceMotion,
   });
   final AnimationController arrival;
-  final double progress;
+  final double balanceFraction;
+  final String referenceLabel;
   final bool isPayday;
   final bool reduceMotion;
 
   @override
-  Widget build(BuildContext context) => SizedBox(
-    height: 236,
-    child: LayoutBuilder(
-      builder: (context, constraints) => AnimatedBuilder(
-        animation: arrival,
-        builder: (context, _) {
-          final intro = reduceMotion
-              ? 1.0
-              : Curves.easeOutCubic.transform(arrival.value);
-          final coinFlight = reduceMotion
-              ? 1.0
-              : Curves.easeInOutCubic.transform(
-                  Interval(.08, .88).transform(arrival.value),
-                );
-          final targetProgress = progress.clamp(0.0, 1.0);
-          final coinPresence = (1 - targetProgress).clamp(0.0, 1.0);
-          final targetX = constraints.maxWidth * (.52 + .22 * targetProgress);
-          final targetY = 6 + 82 * targetProgress;
-          final x =
-              constraints.maxWidth * .48 +
-              (targetX - constraints.maxWidth * .48) * coinFlight;
-          final y =
-              -12 +
-              (targetY + 12) * coinFlight -
-              16 * math.sin(coinFlight * math.pi);
-          final coinScale =
-              .88 +
-              .12 * intro +
-              (isPayday ? .045 * math.sin(intro * math.pi) : 0);
-          return Stack(
-            clipBehavior: Clip.none,
-            alignment: Alignment.center,
-            children: [
-              Positioned(
-                bottom: 2,
-                child: Container(
-                  width: constraints.maxWidth * .72,
-                  height: 30,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(100),
-                    boxShadow: const [
-                      BoxShadow(
-                        color: Color(0x66E71E3F),
-                        blurRadius: 34,
-                        spreadRadius: -8,
-                      ),
-                    ],
-                  ),
+  Widget build(BuildContext context) {
+    const cherry = Color(0xFFFF3C57);
+    final frame = (balanceFraction.clamp(0.0, 1.0) * 5).round();
+    final stateLabel = frame == 0
+        ? 'EMPTY'
+        : frame == 5
+        ? 'FULL'
+        : 'LEVEL $frame / 5';
+    return AnimatedBuilder(
+      animation: arrival,
+      builder: (context, _) {
+        final motion = reduceMotion
+            ? 1.0
+            : Curves.easeOutCubic.transform(arrival.value);
+        final shownLevel = reduceMotion ? frame.toDouble() : frame * motion;
+        return Column(
+          children: [
+            SizedBox(
+              height: 218,
+              width: double.infinity,
+              child: CustomPaint(
+                painter: _WalletMoneyPainter(
+                  level: shownLevel,
+                  motion: motion,
+                  empty: frame == 0,
+                  full: frame == 5,
+                  isPayday: isPayday,
                 ),
               ),
-              Positioned(
-                left: x - 18,
-                top: y,
-                child: Opacity(
-                  opacity: intro * coinPresence,
-                  child: Transform.rotate(
-                    angle: coinFlight * math.pi * 2.2,
-                    child: Transform.scale(
-                      scale: coinScale,
-                      child: const _WalletCoin(size: 36),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 0, 8, 7),
+              child: Row(
+                children: [
+                  const Expanded(child: _Eyebrow('POCKET LEFT')),
+                  Text(
+                    '$stateLabel · ${(balanceFraction.clamp(0.0, 1.0) * 100).round()}%',
+                    style: const TextStyle(
+                      color: cherry,
+                      fontSize: 9,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: .7,
                     ),
                   ),
-                ),
+                ],
               ),
-              Opacity(
-                opacity: intro,
-                child: Transform.translate(
-                  offset: Offset(0, 15 * (1 - intro)),
-                  child: Transform.scale(
-                    scale: coinScale,
-                    child: Image.asset(
-                      'assets/images/paisa_wallet_hero.png',
-                      width: constraints.maxWidth,
-                      height: 220,
-                      fit: BoxFit.contain,
-                      filterQuality: FilterQuality.high,
-                    ),
-                  ),
-                ),
+            ),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 5),
+              child: Text(
+                'Compared with $referenceLabel',
+                style: const TextStyle(color: Color(0xFF8F8588), fontSize: 9),
               ),
-              if (isPayday)
-                Positioned.fill(
-                  child: IgnorePointer(
-                    child: CustomPaint(
-                      painter: _WalletPaydayPulsePainter(
-                        progress: intro,
-                        center: Offset(constraints.maxWidth * .74, targetY),
-                      ),
-                    ),
-                  ),
-                ),
-            ],
-          );
-        },
-      ),
-    ),
-  );
+            ),
+          ],
+        );
+      },
+    );
+  }
 }
 
-class _WalletPaydayPulsePainter extends CustomPainter {
-  const _WalletPaydayPulsePainter({
-    required this.progress,
-    required this.center,
+class _WalletMoneyPainter extends CustomPainter {
+  const _WalletMoneyPainter({
+    required this.level,
+    required this.motion,
+    required this.empty,
+    required this.full,
+    required this.isPayday,
   });
-  final double progress;
-  final Offset center;
+
+  final double level;
+  final double motion;
+  final bool empty;
+  final bool full;
+  final bool isPayday;
+
+  static const _noteColors = [
+    Color(0xFFD5C69B),
+    Color(0xFFB7C7A5),
+    Color(0xFFD1A69A),
+    Color(0xFFADC7C2),
+    Color(0xFFE2D4B5),
+  ];
 
   @override
   void paint(Canvas canvas, Size size) {
-    if (progress < .62) return;
-    final t = ((progress - .62) / .38).clamp(0.0, 1.0);
-    final pulse = math.sin(t * math.pi);
-    final radius = 8 + 24 * Curves.easeOutCubic.transform(t);
-    final bounds = Rect.fromCircle(center: center, radius: radius);
-    canvas.drawCircle(
-      center,
-      radius,
+    final w = size.width;
+    final h = size.height;
+    final wallet = Rect.fromLTWH(w * .09, h * .41, w * .82, h * .48);
+    final pocketTop = wallet.top;
+    final fullLift = full ? 9 * math.sin(motion * math.pi) : 0.0;
+
+    // A small ground glow makes the vector wallet sit in the page instead of
+    // reading like a floating icon.
+    canvas.drawOval(
+      Rect.fromCenter(
+        center: Offset(w * .5, h * .91),
+        width: w * .68,
+        height: h * .08,
+      ),
       Paint()
-        ..style = PaintingStyle.fill
-        ..color = const Color(0xFFFFC768).withValues(alpha: .1 * pulse)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 13),
+        ..color = const Color(0x88E71E3F)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 19),
     );
-    canvas.drawArc(
-      bounds,
-      -math.pi * .82,
-      math.pi * 1.64,
-      false,
+
+    // Five individually drawn notes create six clear wallet states: empty,
+    // then one through five visible notes. The nearest notes are painted last.
+    for (var index = 4; index >= 0; index--) {
+      final reveal = (level - index).clamp(0.0, 1.0);
+      if (reveal <= 0) continue;
+      final note = Rect.fromLTWH(
+        wallet.left + w * .15 + index * 2.4,
+        pocketTop - 17 - 43 * reveal - fullLift + index * 3,
+        wallet.width * .69 - index * 2.4,
+        h * .48,
+      );
+      _drawNote(canvas, note, _noteColors[index], reveal);
+    }
+
+    final tilt = empty
+        ? .018 * math.sin(motion * math.pi * 3) * (1 - motion)
+        : 0.0;
+    canvas.save();
+    canvas.translate(w * .5, h * .65);
+    canvas.rotate(tilt);
+    canvas.translate(-w * .5, -h * .65);
+
+    final shadowRect = wallet.shift(Offset(0, 8));
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(shadowRect, const Radius.circular(27)),
       Paint()
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 1.6
-        ..strokeCap = StrokeCap.round
-        ..color = const Color(0xFFFFD78D).withValues(alpha: .76 * pulse),
+        ..color = const Color(0x99000000)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 15),
     );
-    final secondRadius = radius + 7;
-    canvas.drawArc(
-      Rect.fromCircle(center: center, radius: secondRadius),
-      -math.pi * .28,
-      math.pi * .56,
-      false,
+
+    final walletRRect = RRect.fromRectAndRadius(
+      wallet,
+      const Radius.circular(25),
+    );
+    canvas.drawRRect(
+      walletRRect,
+      Paint()
+        ..shader = const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFF542432), Color(0xFF321923), Color(0xFF21141A)],
+        ).createShader(wallet),
+    );
+    canvas.drawRRect(
+      walletRRect,
       Paint()
         ..style = PaintingStyle.stroke
         ..strokeWidth = 1.1
-        ..strokeCap = StrokeCap.round
-        ..color = const Color(0xFFFFB74E).withValues(alpha: .6 * pulse),
+        ..color = const Color(0x99FF6575),
     );
+
+    // Dark opening and raised lip make the notes read as tucked inside the
+    // wallet, rather than pasted on its front.
+    final opening = RRect.fromRectAndRadius(
+      Rect.fromLTWH(wallet.left + 13, wallet.top - 1, wallet.width - 26, 21),
+      const Radius.circular(10),
+    );
+    canvas.drawRRect(
+      opening,
+      Paint()
+        ..shader = const LinearGradient(
+          colors: [Color(0xFF130D12), Color(0xFF2A111A)],
+        ).createShader(opening.outerRect),
+    );
+    canvas.drawLine(
+      Offset(wallet.left + 18, wallet.top + 2),
+      Offset(wallet.right - 18, wallet.top + 2),
+      Paint()
+        ..color = const Color(0xFFFF8890).withValues(alpha: .65)
+        ..strokeWidth = 1.1
+        ..strokeCap = StrokeCap.round,
+    );
+
+    final flapLift = empty
+        ? -7 * math.sin(motion * math.pi)
+        : full
+        ? -3 * math.sin(motion * math.pi)
+        : 0.0;
+    final flap = RRect.fromRectAndRadius(
+      Rect.fromLTWH(
+        wallet.left + 2,
+        wallet.top + wallet.height * .27 + flapLift,
+        wallet.width - 4,
+        wallet.height * .66,
+      ),
+      const Radius.circular(21),
+    );
+    canvas.drawRRect(
+      flap,
+      Paint()
+        ..shader = const LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Color(0xFF45202B), Color(0xFF2C171F), Color(0xFF24151B)],
+        ).createShader(flap.outerRect),
+    );
+    canvas.drawRRect(
+      flap,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1
+        ..color = const Color(0x66FF7885),
+    );
+
+    // Fine stitch marks and a leather seam add tactile detail at phone size.
+    final stitchPaint = Paint()
+      ..color = const Color(0x99FF8991)
+      ..strokeWidth = 1.1
+      ..strokeCap = StrokeCap.round;
+    final stitchY = wallet.top + wallet.height * .27 + flapLift + 8;
+    for (var i = 0; i < 25; i++) {
+      final x = wallet.left + 18 + i * (wallet.width - 36) / 24;
+      canvas.drawCircle(Offset(x, stitchY), 1, stitchPaint);
+    }
+
+    final snap = Offset(
+      wallet.right - wallet.width * .16,
+      wallet.top + wallet.height * .55 + flapLift * .25,
+    );
+    final snapRadius = wallet.width * .055;
+    canvas.drawCircle(
+      snap,
+      snapRadius + (full ? 5 * math.sin(motion * math.pi) : 0),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.3
+        ..color = const Color(0xFFFFC9A0)
+            .withValues(alpha: full ? .65 * math.sin(motion * math.pi) : 0),
+    );
+    canvas.drawCircle(
+      snap,
+      snapRadius,
+      Paint()
+        ..shader = const RadialGradient(
+          colors: [Color(0xFFFFD8A3), Color(0xFFB65D50), Color(0xFF56212A)],
+        ).createShader(Rect.fromCircle(center: snap, radius: snapRadius)),
+    );
+    canvas.drawCircle(
+      snap,
+      snapRadius * .55,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1
+        ..color = const Color(0xFFFFE3C0),
+    );
+
+    if (empty && motion > .05) {
+      final pulse = math.sin(motion * math.pi);
+      final center = Offset(wallet.center.dx, wallet.top + 4);
+      for (var ring = 0; ring < 2; ring++) {
+        canvas.drawArc(
+          Rect.fromCenter(
+            center: center,
+            width: 48 + ring * 20 + 14 * motion,
+            height: 8 + ring * 3 + 3 * motion,
+          ),
+          math.pi,
+          math.pi,
+          false,
+          Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1
+            ..color = const Color(0xFFFF7180)
+                .withValues(alpha: .36 * pulse * (1 - ring * .25)),
+        );
+      }
+    }
+
+    canvas.restore();
+
+    if (isPayday && motion > .55) {
+      final pulse = math.sin(((motion - .55) / .45).clamp(0.0, 1.0) * math.pi);
+      final center = Offset(
+        wallet.right - wallet.width * .16,
+        wallet.top + wallet.height * .55,
+      );
+      canvas.drawCircle(
+        center,
+        17 + 14 * motion,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.4
+          ..color = const Color(0xFFFFD78D).withValues(alpha: .48 * pulse),
+      );
+    }
+  }
+
+  void _drawNote(Canvas canvas, Rect rect, Color color, double opacity) {
+    final rounded = RRect.fromRectAndRadius(rect, const Radius.circular(8));
+    canvas.drawRRect(
+      rounded,
+      Paint()
+        ..color = const Color(0xFF000000).withValues(alpha: .28 * opacity)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 5),
+    );
+    canvas.drawRRect(
+      rounded,
+      Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [color, Color.lerp(color, const Color(0xFF654D3F), .36)!],
+        ).createShader(rect),
+    );
+    canvas.drawRRect(
+      rounded,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1
+        ..color = const Color(0xFFEFE3C5).withValues(alpha: .72 * opacity),
+    );
+    final inset = rect.deflate(6);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(inset, const Radius.circular(5)),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1
+        ..color = const Color(0xFF5C5547).withValues(alpha: .48 * opacity),
+    );
+    final sealCenter = Offset(rect.right - rect.height * .48, rect.center.dy);
+    canvas.drawCircle(
+      sealCenter,
+      rect.height * .19,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2
+        ..color = const Color(0xFF665C48).withValues(alpha: .62 * opacity),
+    );
+    final symbol = TextPainter(
+      text: TextSpan(
+        text: '₹',
+        style: TextStyle(
+          color: const Color(0xFF5D5343).withValues(alpha: .82 * opacity),
+          fontSize: rect.height * .26,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+      textDirection: ui.TextDirection.ltr,
+    )..layout();
+    symbol.paint(
+      canvas,
+      Offset(
+        sealCenter.dx - symbol.width / 2,
+        sealCenter.dy - symbol.height / 2,
+      ),
+    );
+    final linePaint = Paint()
+      ..color = const Color(0xFF5E5547).withValues(alpha: .46 * opacity)
+      ..strokeWidth = 1;
+    for (var line = 0; line < 3; line++) {
+      final y = rect.top + rect.height * (.34 + line * .15);
+      canvas.drawLine(
+        Offset(rect.left + 11, y),
+        Offset(rect.left + rect.width * .39, y),
+        linePaint,
+      );
+    }
   }
 
   @override
-  bool shouldRepaint(covariant _WalletPaydayPulsePainter oldDelegate) =>
-      oldDelegate.progress != progress || oldDelegate.center != center;
-}
-
-class _WalletCoin extends StatelessWidget {
-  const _WalletCoin({required this.size});
-  final double size;
-
-  @override
-  Widget build(BuildContext context) => Container(
-    width: size,
-    height: size,
-    decoration: BoxDecoration(
-      shape: BoxShape.circle,
-      gradient: const RadialGradient(
-        center: Alignment(-.38, -.42),
-        radius: .92,
-        colors: [
-          Color(0xFFFFE5AE),
-          Color(0xFFFFB94E),
-          Color(0xFFDB7627),
-          Color(0xFF962E28),
-        ],
-        stops: [0, .34, .76, 1],
-      ),
-      border: Border.all(color: const Color(0xFFFFD18A), width: 1.4),
-      boxShadow: const [
-        BoxShadow(color: Color(0x88F0443E), blurRadius: 17, spreadRadius: 1),
-        BoxShadow(
-          color: Color(0x99530C19),
-          blurRadius: 6,
-          offset: Offset(0, 4),
-        ),
-      ],
-    ),
-    child: Center(
-      child: Container(
-        width: size * .62,
-        height: size * .62,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          border: Border.all(color: const Color(0x99FFF0D1), width: 1),
-        ),
-        child: Center(
-          child: Container(
-            width: size * .13,
-            height: size * .13,
-            decoration: const BoxDecoration(
-              shape: BoxShape.circle,
-              color: Color(0xFFFFF1D6),
-            ),
-          ),
-        ),
-      ),
-    ),
-  );
+  bool shouldRepaint(covariant _WalletMoneyPainter oldDelegate) =>
+      oldDelegate.level != level ||
+      oldDelegate.motion != motion ||
+      oldDelegate.empty != empty ||
+      oldDelegate.full != full ||
+      oldDelegate.isPayday != isPayday;
 }
 
 class _WalletProgress extends StatelessWidget {
