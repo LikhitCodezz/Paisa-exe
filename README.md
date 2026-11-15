@@ -1,92 +1,96 @@
 # Paisa.exe
 
-**Your money, decoded.** Paisa.exe is an Android-first pocket-money and spending companion for VIT students. This repository is the private source-code bookmark for the current Flutter version of the app.
+**Your money, decoded.** — an offline-first pocket-money companion for VIT students, built in Flutter.
 
-## What it does
+> Money talks. This one actually listens (and remembers what you spent it on).
 
-- Tracks your pocket balance, income, expenses, and monthly budgets.
-- Lets you record recurring pocket money and see when the next payment is due.
-- Includes a wallet illustration that changes through six states as your balance changes relative to your pocket-money amount.
-- Offers transaction history, monthly insights, and CSV export/import.
-- Includes campus food menus for testing; the current menu data is sample data.
-- Supports color themes, hidden amounts, and reduced motion.
+Paisa.exe tracks pocket balance, income, expenses, monthly budgets, and recurring pocket money. It also has transaction history, monthly insights, CSV export/import, Price Memory for comparing prices you've explicitly logged, campus food menus for quick logging, and **"Your Money Has a Lore"** — a seven-chapter offline story that quietly reacts to your spending patterns and remembers every choice you make.
 
-## Current scope
+No accounts. No cloud. No ads. Your data lives on your phone and nowhere else.
 
-- **Platform:** Android, built with Flutter and Dart.
-- **Storage:** Financial data is stored locally on the device. There is no account, cloud sync, or website connected to this version yet.
-- **Website:** Not included in this repository version.
-- **App ID:** `com.paisaexe.app`
-- **Version:** `0.1.0+1`
+## Download the app
 
-GitHub stores this app's source code. It does **not** back up the transactions or settings on your phone. Local app data usually survives app updates, but uninstalling the app or clearing its storage can erase it. Export a CSV from the app if you need a separate transaction backup.
+**[⬇ Download Paisa.apk (latest release)](https://github.com/LikhitCodezz/Paisa-exe/releases/latest/download/Paisa.apk)**
 
-## Run it again
+### Install on your Android phone
 
-### What you need
+1. Tap the link above on your phone (or send the APK to yourself via WhatsApp/Drive).
+2. Open the downloaded `Paisa.apk`. If Android says "Install blocked", tap **Settings → Allow from this source** for your browser/file manager, then retry.
+3. If you already have an older Paisa.exe installed, **uninstall it first** — Android refuses to overwrite an app signed with a different key.
+4. Tap **Install**, then **Open**.
 
-- Flutter SDK with Dart **3.13.5 or newer**.
-- Android Studio with the Android SDK installed, or another Android device configured for Flutter.
-- An Android phone with USB debugging enabled, or an Android emulator.
+> The APK is signed with the debug keystore for now, so it's meant for sideloading among friends, not the Play Store. Updates replace the old version cleanly as long as the signing key stays the same.
 
-### Open the project
+## What's inside
 
-1. Clone this private repository with GitHub Desktop, or open its existing local folder.
-2. Open the `Paisa-exe` folder in Android Studio. If prompted, let Android Studio install or configure the Flutter and Dart plugins.
-3. In Android Studio's terminal, run:
+- Tracks pocket balance, income, expenses, and monthly budgets
+- Records recurring pocket money and shows when the next payment is due
+- Wallet illustration that shifts through six states as your balance changes
+- Transaction history, monthly insights, CSV export/import
+- Price Memory — item history and place labels for prices you've logged
+- Campus food menus for one-tap logging
+- *Your Money Has a Lore* — a seven-chapter offline story with choices that stick
+- Color themes, hidden amounts, reduced motion
 
-   ```sh
-   flutter pub get
-   ```
+## Run it yourself
 
-4. Connect your phone, accept its USB debugging prompt, or start an emulator.
-5. Check that Flutter sees the device, then launch the app:
+### You'll need
 
-   ```sh
-   flutter devices
-   flutter run
-   ```
+- Flutter SDK with Dart **3.13.5+**
+- Android Studio + Android SDK (or any Android device with USB debugging)
+- An Android phone or emulator
 
-You can also select the phone in Android Studio's device menu and press **Run ▶**.
+### Steps
 
-## Build an Android APK
+```sh
+git clone https://github.com/LikhitCodezz/Paisa-exe.git
+cd Paisa-exe
+flutter pub get
+flutter run
+```
 
-From the project folder, run:
+Or open the folder in Android Studio and hit **Run ▶**.
+
+### Build a release APK
 
 ```sh
 flutter pub get
 flutter build apk --release
 ```
 
-The APK is written to:
-
-```text
-build/app/outputs/flutter-apk/app-release.apk
-```
-
-To install that APK on a connected phone with Flutter, run:
-
-```sh
-flutter install
-```
-
-The current Android release build uses debug signing for local testing. It is not configured as a Play Store release.
+Output lands at `build/app/outputs/flutter-apk/app-release.apk`. Rename it to `Paisa.apk` if you're publishing it as a release asset.
 
 ## Project map
 
 ```text
 lib/
-  main.dart          Flutter screens, widgets, animations, and app entry point
-  paisa_store.dart   Local data, transactions, settings, and allowance logic
-assets/images/       App logo and wallet artwork
-android/             Android app and Gradle configuration
+  main.dart          screens, widgets, animations, app entry point
+  paisa_store.dart   local data, transactions, settings, allowance logic
+  lore.dart          story engine and the seven-chapter arc
+  lore_page.dart     cinematic reader, archive, typewriter reveal
+assets/images/       logo + wallet artwork
+android/             Android + Gradle config
 test/                Flutter tests
+legacy/              the older web version (kept for reference)
 ```
 
-## Keep this repository private
+## A few honest notes
 
-This repository is intended as a personal project backup. Before making it public, review the files and Git history for personal data, credentials, signing keys, or other private material. Never commit real transaction exports or Android signing secrets.
+- **Offline only.** Financial data is stored locally. No account, no cloud sync, no website wired up yet.
+- **Hidden transactions** are encrypted with AES-GCM via Android Keystore. There's no PIN recovery — lose the device/key and they're gone. Treat the PIN as a privacy gate, not a security guarantee.
+- **Local app data survives updates** but not uninstalls or "clear storage". Export a CSV if you want a real backup.
+- App ID: `com.paisaexe.app` · Version: `1.0.0+1`
+
+## Publishing a release (for the download link above)
+
+The README's download link points at the latest GitHub Release asset named `Paisa.apk`. To make it live:
+
+1. Build: `flutter build apk --release`
+2. Rename `build/app/outputs/flutter-apk/app-release.apk` → `Paisa.apk`
+3. GitHub → Releases → "Draft a new release" → tag `v1.0.0` → attach `Paisa.apk` → Publish
+
+Until a release exists, the link will 404 — that's expected, not a bug.
 
 ---
 
-Made by **Likhit**.
+Made by **Likhit**. Enjoy your paisa. 🪙

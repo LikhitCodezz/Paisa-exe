@@ -85,6 +85,326 @@ class _SensitiveValue extends StatelessWidget {
   }
 }
 
+String _pinFailureMessage(PrivacyPinAttempt result) =>
+    result.retryAfterSeconds > 0
+    ? 'Too many incorrect attempts. Try again in ${result.retryAfterSeconds} seconds.'
+    : 'That PIN did not match. ${result.attemptsRemaining} ${result.attemptsRemaining == 1 ? 'attempt' : 'attempts'} before a short pause.';
+
+/// Disposes dialog text controllers only after the dialog route has fully left
+/// the tree. Disposing them as soon as `showDialog` completes throws
+/// "A TextEditingController was used after being disposed", because the exit
+/// transition still rebuilds the dialog's fields.
+void _disposeDialogControllers(List<TextEditingController> controllers) {
+  Future<void>.delayed(const Duration(milliseconds: 400), () {
+    for (final controller in controllers) {
+      controller.dispose();
+    }
+  });
+}
+
+Future<bool> _createPrivacyPin(BuildContext context, PaisaStore store) async {
+  final pin = TextEditingController();
+  final confirmation = TextEditingController();
+  var error = '';
+  var saving = false;
+  final result = await showDialog<bool>(
+    context: context,
+    barrierDismissible: false,
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (context, setDialogState) => AlertDialog(
+        scrollable: true,
+        title: const Text('Create a hidden transaction PIN'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              'Choose four digits. You will need this PIN to show a hidden transaction again.',
+              style: TextStyle(
+                color: Theme.of(context).hintColor,
+                fontSize: 11,
+              ),
+            ),
+            const SizedBox(height: 12),
+            _PinField(controller: pin, label: 'New 4-digit PIN'),
+            const SizedBox(height: 7),
+            _PinField(controller: confirmation, label: 'Confirm PIN'),
+            if (error.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(
+                error,
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontSize: 10,
+                ),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: saving
+                ? null
+                : () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: saving
+                ? null
+                : () async {
+                    if (!RegExp(r'^\d{4}$').hasMatch(pin.text)) {
+                      setDialogState(
+                        () => error = 'Enter exactly four digits.',
+                      );
+                      return;
+                    }
+                    if (pin.text != confirmation.text) {
+                      setDialogState(() => error = 'Those PINs do not match.');
+                      return;
+                    }
+                    setDialogState(() {
+                      saving = true;
+                      error = '';
+                    });
+                    try {
+                      await store.setPrivacyPin(pin.text);
+                      if (dialogContext.mounted) {
+                        FocusScope.of(dialogContext).unfocus();
+                        Navigator.of(
+                          dialogContext,
+                          rootNavigator: true,
+                        ).pop(true);
+                      }
+                    } on PlatformException catch (_) {
+                      if (!dialogContext.mounted) return;
+                      setDialogState(() {
+                        saving = false;
+                        error = 'Could not save the PIN securely. Try again.';
+                      });
+                    }
+                  },
+            child: const Text('Save PIN'),
+          ),
+        ],
+      ),
+    ),
+  );
+  _disposeDialogControllers([pin, confirmation]);
+  return result == true;
+}
+
+Future<bool> _verifyPrivacyPin(BuildContext context, PaisaStore store) async {
+  final pin = TextEditingController();
+  var error = '';
+  var checking = false;
+  final result = await showDialog<bool>(
+    context: context,
+    barrierDismissible: false,
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (context, setDialogState) => AlertDialog(
+        scrollable: true,
+        title: const Text('Show this transaction?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Enter your four-digit hidden transaction PIN.'),
+            const SizedBox(height: 10),
+            _PinField(controller: pin, label: 'PIN'),
+            if (error.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(
+                error,
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontSize: 10,
+                ),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: checking
+                ? null
+                : () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: checking
+                ? null
+                : () async {
+                    if (!RegExp(r'^\d{4}$').hasMatch(pin.text)) {
+                      setDialogState(
+                        () => error = 'Enter exactly four digits.',
+                      );
+                      return;
+                    }
+                    setDialogState(() {
+                      checking = true;
+                      error = '';
+                    });
+                    try {
+                      final attempt = await store.verifyPrivacyPin(pin.text);
+                      if (!dialogContext.mounted) return;
+                      if (attempt.success) {
+                        FocusScope.of(dialogContext).unfocus();
+                        Navigator.of(
+                          dialogContext,
+                          rootNavigator: true,
+                        ).pop(true);
+                      } else {
+                        setDialogState(() {
+                          checking = false;
+                          error = _pinFailureMessage(attempt);
+                          pin.clear();
+                        });
+                      }
+                    } on PlatformException catch (_) {
+                      if (!dialogContext.mounted) return;
+                      setDialogState(() {
+                        checking = false;
+                        error = 'Secure PIN check is unavailable right now.';
+                      });
+                    } catch (_) {
+                      if (!dialogContext.mounted) return;
+                      setDialogState(() {
+                        checking = false;
+                        error = 'Could not verify the PIN. Try again.';
+                      });
+                    }
+                  },
+            child: const Text('Unlock'),
+          ),
+        ],
+      ),
+    ),
+  );
+  _disposeDialogControllers([pin]);
+  return result == true;
+}
+
+Future<void> _managePrivacyPin(BuildContext context, PaisaStore store) async {
+  final exists = await store.hasPrivacyPin();
+  if (!exists) {
+    await _createPrivacyPin(context, store);
+    return;
+  }
+  final oldPin = TextEditingController();
+  final newPin = TextEditingController();
+  final confirmation = TextEditingController();
+  var error = '';
+  var saving = false;
+  await showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (context, setDialogState) => AlertDialog(
+        scrollable: true,
+        title: const Text('Change hidden transaction PIN'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _PinField(controller: oldPin, label: 'Current PIN'),
+              const SizedBox(height: 8),
+              _PinField(controller: newPin, label: 'New 4-digit PIN'),
+              const SizedBox(height: 8),
+              _PinField(controller: confirmation, label: 'Confirm new PIN'),
+              if (error.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(
+                  error,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                    fontSize: 10,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: saving ? null : () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: saving
+                ? null
+                : () async {
+                    if (!RegExp(r'^\d{4}$').hasMatch(oldPin.text) ||
+                        !RegExp(r'^\d{4}$').hasMatch(newPin.text)) {
+                      setDialogState(
+                        () => error = 'Each PIN must be four digits.',
+                      );
+                      return;
+                    }
+                    if (newPin.text != confirmation.text) {
+                      setDialogState(
+                        () => error = 'The new PINs do not match.',
+                      );
+                      return;
+                    }
+                    if (oldPin.text == newPin.text) {
+                      setDialogState(
+                        () => error = 'Choose a different new PIN.',
+                      );
+                      return;
+                    }
+                    setDialogState(() {
+                      saving = true;
+                      error = '';
+                    });
+                    try {
+                      final attempt = await store.changePrivacyPin(
+                        oldPin.text,
+                        newPin.text,
+                      );
+                      if (!dialogContext.mounted) return;
+                      if (attempt.success) {
+                        FocusScope.of(dialogContext).unfocus();
+                        Navigator.of(dialogContext, rootNavigator: true).pop();
+                      } else {
+                        setDialogState(() {
+                          saving = false;
+                          error = _pinFailureMessage(attempt);
+                          oldPin.clear();
+                        });
+                      }
+                    } on PlatformException catch (_) {
+                      if (!dialogContext.mounted) return;
+                      setDialogState(() {
+                        saving = false;
+                        error = 'Could not change the PIN securely. Try again.';
+                      });
+                    }
+                  },
+            child: const Text('Change PIN'),
+          ),
+        ],
+      ),
+    ),
+  );
+  _disposeDialogControllers([oldPin, newPin, confirmation]);
+}
+
+class _PinField extends StatelessWidget {
+  const _PinField({required this.controller, required this.label});
+  final TextEditingController controller;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) => TextField(
+    controller: controller,
+    keyboardType: TextInputType.number,
+    obscureText: true,
+    maxLength: 4,
+    autocorrect: false,
+    enableSuggestions: false,
+    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+    decoration: InputDecoration(labelText: label, counterText: ''),
+  );
+}
+
 String dayLabel(DateTime date) => DateFormat('EEE · d MMM').format(date);
 String dateLabel(DateTime date) => DateFormat('dd MMM yyyy').format(date);
 String isoDay(DateTime date) => DateFormat('yyyy-MM-dd').format(date);
@@ -105,102 +425,147 @@ String categoryIcon(String category) =>
     }[category] ??
     '✳️';
 
-class PaisaApp extends StatelessWidget {
+class PaisaApp extends StatefulWidget {
   const PaisaApp({super.key, required this.store});
   final PaisaStore store;
 
   @override
-  Widget build(BuildContext context) => AnimatedBuilder(
-    animation: store,
-    builder: (context, _) {
-      final accent = _palettes[store.palette] ?? _palettes['cherry']!;
-      final brightness = store.lightMode ? Brightness.light : Brightness.dark;
-      final scheme =
-          ColorScheme.fromSeed(
-            seedColor: accent,
-            brightness: brightness,
-          ).copyWith(
-            primary: accent,
-            secondary: accent,
-            surface: store.lightMode
-                ? const Color(0xFFFFFFFF)
-                : const Color(0xFF141821),
-          );
-      return MaterialApp(
-        title: 'Paisa.exe',
-        debugShowCheckedModeBanner: false,
-        theme: ThemeData(
-          useMaterial3: true,
+  State<PaisaApp> createState() => _PaisaAppState();
+}
+
+class _PaisaAppState extends State<PaisaApp> {
+  late String _palette;
+  late bool _lightMode;
+
+  @override
+  void initState() {
+    super.initState();
+    _palette = widget.store.palette;
+    _lightMode = widget.store.lightMode;
+    widget.store.addListener(_syncTheme);
+  }
+
+  @override
+  void didUpdateWidget(covariant PaisaApp oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.store != widget.store) {
+      oldWidget.store.removeListener(_syncTheme);
+      _palette = widget.store.palette;
+      _lightMode = widget.store.lightMode;
+      widget.store.addListener(_syncTheme);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.store.removeListener(_syncTheme);
+    super.dispose();
+  }
+
+  void _syncTheme() {
+    final palette = widget.store.palette;
+    final lightMode = widget.store.lightMode;
+    if (palette == _palette && lightMode == _lightMode) return;
+    setState(() {
+      _palette = palette;
+      _lightMode = lightMode;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final store = widget.store;
+    final accent = _palettes[_palette] ?? _palettes['cherry']!;
+    final brightness = _lightMode ? Brightness.light : Brightness.dark;
+    final scheme =
+        ColorScheme.fromSeed(
+          seedColor: accent,
           brightness: brightness,
-          colorScheme: scheme,
-          scaffoldBackgroundColor: store.lightMode
-              ? const Color(0xFFF2F4F7)
-              : const Color(0xFF0B0D12),
-          appBarTheme: AppBarTheme(
-            backgroundColor: Colors.transparent,
-            foregroundColor: scheme.onSurface,
-          ),
-          navigationBarTheme: NavigationBarThemeData(
-            backgroundColor: store.lightMode
-                ? Colors.white
-                : const Color(0xFF11141C),
-            indicatorColor: accent.withValues(alpha: .13),
-            labelTextStyle: WidgetStateProperty.resolveWith(
-              (states) => TextStyle(
-                fontSize: 10,
-                fontWeight: states.contains(WidgetState.selected)
-                    ? FontWeight.w700
-                    : FontWeight.w500,
-              ),
+        ).copyWith(
+          primary: accent,
+          secondary: accent,
+          surface: store.lightMode
+              ? const Color(0xFFFFFFFF)
+              : const Color(0xFF141821),
+        );
+    return MaterialApp(
+      title: 'Paisa.exe',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        brightness: brightness,
+        colorScheme: scheme,
+        scaffoldBackgroundColor: store.lightMode
+            ? const Color(0xFFF2F4F7)
+            : const Color(0xFF0B0D12),
+        appBarTheme: AppBarTheme(
+          backgroundColor: Colors.transparent,
+          foregroundColor: scheme.onSurface,
+        ),
+        navigationBarTheme: NavigationBarThemeData(
+          backgroundColor: store.lightMode
+              ? Colors.white
+              : const Color(0xFF11141C),
+          indicatorColor: accent.withValues(alpha: .13),
+          labelTextStyle: WidgetStateProperty.resolveWith(
+            (states) => TextStyle(
+              fontSize: 10,
+              fontWeight: states.contains(WidgetState.selected)
+                  ? FontWeight.w700
+                  : FontWeight.w500,
             ),
-          ),
-          snackBarTheme: SnackBarThemeData(
-            backgroundColor: store.lightMode
-                ? const Color(0xFF202630)
-                : const Color(0xFF252B38),
-            contentTextStyle: const TextStyle(color: Colors.white),
-            behavior: SnackBarBehavior.floating,
-          ),
-          dividerColor: scheme.outlineVariant.withValues(alpha: .36),
-          inputDecorationTheme: InputDecorationTheme(
-            filled: true,
-            fillColor: store.lightMode
-                ? const Color(0xFFF6F7FA)
-                : const Color(0xFF10131B),
-            contentPadding: const EdgeInsets.symmetric(
-              horizontal: 14,
-              vertical: 13,
-            ),
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(14),
-              borderSide: BorderSide(color: scheme.outlineVariant),
-            ),
-            enabledBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(14),
-              borderSide: BorderSide(
-                color: scheme.outlineVariant.withValues(alpha: .6),
-              ),
-            ),
-            focusedBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(14),
-              borderSide: BorderSide(color: accent, width: 1.5),
-            ),
-          ),
-          textSelectionTheme: TextSelectionThemeData(
-            cursorColor: accent,
-            selectionColor: accent.withValues(alpha: .25),
-            selectionHandleColor: accent,
           ),
         ),
-        builder: (context, child) => MediaQuery(
-          data: MediaQuery.of(context)
-              .copyWith(disableAnimations: store.reduceMotion),
+        snackBarTheme: SnackBarThemeData(
+          backgroundColor: store.lightMode
+              ? const Color(0xFF202630)
+              : const Color(0xFF252B38),
+          contentTextStyle: const TextStyle(color: Colors.white),
+          behavior: SnackBarBehavior.floating,
+        ),
+        dividerColor: scheme.outlineVariant.withValues(alpha: .36),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: store.lightMode
+              ? const Color(0xFFF6F7FA)
+              : const Color(0xFF10131B),
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 14,
+            vertical: 13,
+          ),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: BorderSide(color: scheme.outlineVariant),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: BorderSide(
+              color: scheme.outlineVariant.withValues(alpha: .6),
+            ),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: BorderSide(color: accent, width: 1.5),
+          ),
+        ),
+        textSelectionTheme: TextSelectionThemeData(
+          cursorColor: accent,
+          selectionColor: accent.withValues(alpha: .25),
+          selectionHandleColor: accent,
+        ),
+      ),
+      builder: (context, child) {
+        final media = MediaQuery.of(context);
+        return MediaQuery(
+          data: media.copyWith(
+            disableAnimations: media.disableAnimations || store.reduceMotion,
+          ),
           child: child ?? const SizedBox.shrink(),
-        ),
-        home: SplashSequence(store: store),
-      );
-    },
-  );
+        );
+      },
+      home: SplashSequence(store: store),
+    );
+  }
 }
 
 // Two intentional beats: the brand, then the catchphrase.
@@ -231,11 +596,11 @@ class _SplashSequenceState extends State<SplashSequence>
     ).isPayday;
     _brandReveal = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1050),
+      duration: const Duration(milliseconds: 760),
     );
     _phraseReveal = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 820),
+      duration: const Duration(milliseconds: 560),
     );
     _orbit = AnimationController(
       vsync: this,
@@ -246,13 +611,19 @@ class _SplashSequenceState extends State<SplashSequence>
     } else {
       _brandReveal.forward();
       _orbit.repeat();
-      _brandTimer = Timer(const Duration(milliseconds: 1800), () {
+      // Keep the logo and author signature on screen long enough to land
+      // before the separate tagline screen appears.
+      _brandTimer = Timer(const Duration(milliseconds: 2400), () {
         if (!mounted) return;
         setState(() => _second = true);
         _phraseReveal.forward(from: 0);
       });
-      _finishTimer = Timer(const Duration(milliseconds: 3800), () {
-        if (mounted) setState(() => _done = true);
+      _finishTimer = Timer(const Duration(milliseconds: 3900), () {
+        if (!mounted) return;
+        // The splash State stays mounted behind the shell, so the looping
+        // brand ticker must be stopped or it keeps requesting frames forever.
+        _orbit.stop();
+        setState(() => _done = true);
       });
     }
   }
@@ -695,7 +1066,7 @@ class _PaisaShellState extends State<PaisaShell>
     _pageMotion =
         AnimationController(
             vsync: this,
-            duration: const Duration(milliseconds: 360),
+            duration: const Duration(milliseconds: 300),
           )
           ..addStatusListener((status) {
             if (status == AnimationStatus.completed && mounted) {
@@ -724,6 +1095,7 @@ class _PaisaShellState extends State<PaisaShell>
       _queuedPage = null;
       return;
     }
+    HapticFeedback.selectionClick();
     // Each time a tab is opened, start its main vertical page at the top.
     // Jump before switching so the new tab never flashes its old scroll spot.
     final scrollController = _tabScrollControllers[index];
@@ -751,7 +1123,7 @@ class _PaisaShellState extends State<PaisaShell>
     _pageMotion.forward(from: 0);
   }
 
-  Widget _switchingBody(List<Widget> views) {
+  Widget _switchingBody(List<Widget Function()> views) {
     final order = [
       for (var i = 0; i < views.length; i++)
         if (i != _page && i != _previousPage) i,
@@ -759,63 +1131,77 @@ class _PaisaShellState extends State<PaisaShell>
       if (_previousPage != null) _previousPage!,
     ];
     return LayoutBuilder(
-      builder: (context, constraints) => Stack(
-        fit: StackFit.expand,
-        children: [
-          for (final index in order)
-            Positioned.fill(
-              key: ValueKey('paisa-tab-$index'),
-              child: AnimatedBuilder(
-                animation: _pageMotion,
-                child: PrimaryScrollController(
-                  controller: _tabScrollControllers[index],
-                  child: views[index],
-                ),
-                builder: (context, child) {
-                  final isCurrent = index == _page;
-                  final isLeaving = index == _previousPage;
-                  final t = Curves.easeInOutCubic.transform(_pageMotion.value);
-                  final visible = isCurrent || isLeaving;
-                  final x = isCurrent
-                      ? _pageDirection * constraints.maxWidth * (1 - t)
-                      : -_pageDirection * constraints.maxWidth * t;
-                  return IgnorePointer(
-                    ignoring: !isCurrent,
-                    child: Offstage(
-                      offstage: !visible,
-                      child: TickerMode(
-                        enabled: isCurrent,
-                        child: Transform.translate(
-                          offset: Offset(x, 0),
-                          child: child,
-                        ),
-                      ),
+      builder: (context, constraints) {
+        Widget pageLayer(int index) {
+          final isCurrent = index == _page;
+          final isLeaving = index == _previousPage;
+          final visible = isCurrent || isLeaving;
+          final page = _TabPage(
+            store: widget.store,
+            controller: _tabScrollControllers[index],
+            active: visible,
+            builder: views[index],
+          );
+          if (!visible) {
+            return TickerMode(enabled: false, child: Offstage(child: page));
+          }
+          return AnimatedBuilder(
+            animation: _pageMotion,
+            child: page,
+            builder: (context, child) {
+              final t = Curves.easeOutCubic.transform(_pageMotion.value);
+              final x = isCurrent
+                  ? _pageDirection * constraints.maxWidth * .34 * (1 - t)
+                  : -_pageDirection * constraints.maxWidth * .16 * t;
+              return IgnorePointer(
+                ignoring: !isCurrent,
+                child: TickerMode(
+                  enabled: isCurrent,
+                  child: Opacity(
+                    opacity: isCurrent ? .55 + .45 * t : 1 - t,
+                    child: Transform.translate(
+                      offset: Offset(x, 0),
+                      child: child,
                     ),
-                  );
-                },
+                  ),
+                ),
+              );
+            },
+          );
+        }
+
+        return Stack(
+          fit: StackFit.expand,
+          children: [
+            for (final index in order)
+              Positioned.fill(
+                key: ValueKey('paisa-tab-$index'),
+                child: pageLayer(index),
               ),
-            ),
-        ],
-      ),
+          ],
+        );
+      },
     );
   }
 
-  void _addTransaction([Map<String, dynamic>? preset]) =>
-      showModalBottomSheet<void>(
-        context: context,
-        isScrollControlled: true,
-        useSafeArea: true,
-        backgroundColor: Colors.transparent,
-        builder: (_) => TransactionEditor(store: widget.store, preset: preset),
-      );
+  void _addTransaction([Map<String, dynamic>? preset]) {
+    HapticFeedback.lightImpact();
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => TransactionEditor(store: widget.store, preset: preset),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final store = widget.store;
-    final views = [
-      HomeScreen(store: store, onNavigate: _goToPage),
-      ActivityScreen(store: store, onEdit: (t) => _addTransaction(t)),
-      CampusScreen(
+    final views = <Widget Function()>[
+      () => HomeScreen(store: store, onNavigate: _goToPage),
+      () => ActivityScreen(store: store, onEdit: (t) => _addTransaction(t)),
+      () => CampusScreen(
         store: store,
         onChoose: (food) => _addTransaction({
           'type': 'expense',
@@ -826,17 +1212,20 @@ class _PaisaShellState extends State<PaisaShell>
           'foodShop': food['shop'],
         }),
       ),
-      BudgetsScreen(store: store),
-      InsightsScreen(store: store, onPage: _goToPage),
-      SettingsScreen(store: store, onPage: _goToPage),
+      () => BudgetsScreen(store: store),
+      () => InsightsScreen(store: store, onPage: _goToPage),
+      () => SettingsScreen(store: store, onPage: _goToPage),
     ];
     return Scaffold(
       appBar: PreferredSize(
         preferredSize: const Size.fromHeight(67),
-        child: _TopBar(
-          store: store,
-          onPrivacy: () => store.saveSettings(hideBalances: !store.privacy),
-          onAdd: () => _addTransaction(),
+        child: AnimatedBuilder(
+          animation: store,
+          builder: (context, _) => _TopBar(
+            store: store,
+            onPrivacy: () => store.saveSettings(hideBalances: !store.privacy),
+            onAdd: () => _addTransaction(),
+          ),
         ),
       ),
       body: _switchingBody(views),
@@ -872,6 +1261,60 @@ class _PaisaShellState extends State<PaisaShell>
         ],
       ),
     );
+  }
+}
+
+class _TabPage extends StatefulWidget {
+  const _TabPage({
+    required this.store,
+    required this.controller,
+    required this.active,
+    required this.builder,
+  });
+
+  final PaisaStore store;
+  final ScrollController controller;
+  final bool active;
+  final Widget Function() builder;
+
+  @override
+  State<_TabPage> createState() => _TabPageState();
+}
+
+class _TabPageState extends State<_TabPage> {
+  Widget? _page;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.active) widget.store.addListener(_handleStoreChange);
+  }
+
+  @override
+  void didUpdateWidget(covariant _TabPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.store != widget.store || oldWidget.active != widget.active) {
+      if (oldWidget.active) oldWidget.store.removeListener(_handleStoreChange);
+      if (widget.active) widget.store.addListener(_handleStoreChange);
+    }
+  }
+
+  void _handleStoreChange() {
+    if (mounted && widget.active) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    if (widget.active) widget.store.removeListener(_handleStoreChange);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.active) _page = widget.builder();
+    final page = _page;
+    if (page == null) return const SizedBox.shrink();
+    return PrimaryScrollController(controller: widget.controller, child: page);
   }
 }
 
@@ -912,23 +1355,33 @@ class _TopBar extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            Text.rich(
-              TextSpan(
-                children: [
-                  const TextSpan(text: 'paisa'),
-                  TextSpan(
-                    text: '.exe',
-                    style: TextStyle(color: accent),
+            Expanded(
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text.rich(
+                    TextSpan(
+                      children: [
+                        const TextSpan(text: 'paisa'),
+                        TextSpan(
+                          text: '.exe',
+                          style: TextStyle(color: accent),
+                        ),
+                      ],
+                    ),
+                    maxLines: 1,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 19,
+                      letterSpacing: -.8,
+                    ),
                   ),
-                ],
-              ),
-              style: const TextStyle(
-                fontWeight: FontWeight.w800,
-                fontSize: 19,
-                letterSpacing: -.8,
+                ),
               ),
             ),
-            const Spacer(),
+            const SizedBox(width: 8),
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
               decoration: BoxDecoration(
@@ -1053,7 +1506,7 @@ class _DateStamp extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Container(
     width: 102,
-    height: 70,
+    constraints: const BoxConstraints(minHeight: 70),
     padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
     decoration: BoxDecoration(
       color: Theme.of(context).colorScheme.surface,
@@ -1090,30 +1543,36 @@ class _DateStamp extends StatelessWidget {
                   fontWeight: FontWeight.w800,
                 ),
               ),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.baseline,
-                textBaseline: TextBaseline.alphabetic,
-                children: [
-                  Text(
-                    '${date.day}',
-                    style: const TextStyle(
-                      fontSize: 29,
-                      height: 1,
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: -1.5,
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.centerLeft,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.baseline,
+                  textBaseline: TextBaseline.alphabetic,
+                  children: [
+                    Text(
+                      '${date.day}',
+                      style: const TextStyle(
+                        fontSize: 29,
+                        height: 1,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: -1.5,
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    DateFormat('MMM').format(date).toUpperCase(),
-                    style: TextStyle(
-                      fontSize: 9,
-                      color: Theme.of(context).hintColor,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: .3,
+                    const SizedBox(width: 4),
+                    Text(
+                      DateFormat('MMM').format(date).toUpperCase(),
+                      maxLines: 1,
+                      style: TextStyle(
+                        fontSize: 9,
+                        color: Theme.of(context).hintColor,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: .3,
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
               Text(
                 '${date.year}',
@@ -1138,7 +1597,9 @@ class HomeScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final m = store.monthTransactions;
-    final income = store.total('income', m), spent = store.total('expense', m);
+    final recentTransactions = store.sortedTransactions.take(3).toList();
+    final income = store.visibleMonthlyIncomeTotal;
+    final spent = store.visibleMonthlyExpenseTotal;
     final remaining = store.monthlyBudget - spent;
     final pct = store.monthlyBudget <= 0
         ? 0.0
@@ -1200,13 +1661,13 @@ class HomeScreen extends StatelessWidget {
               const SizedBox(height: 7),
               _SensitiveValue(
                 store: store,
-                mask: 'Starting balance · hidden',
+                mask: 'Balance details hidden',
                 style: TextStyle(
                   fontSize: 10,
                   color: Theme.of(context).hintColor,
                 ),
                 child: Text(
-                  'Starting balance ${money(store.openingBalance)} · from the entries you add',
+                  'Built from the entries you add.',
                   style: TextStyle(
                     fontSize: 10,
                     color: Theme.of(context).hintColor,
@@ -1371,21 +1832,19 @@ class HomeScreen extends StatelessWidget {
                 ],
               ),
               const SizedBox(height: 3),
-              if (store.sortedTransactions.isEmpty)
+              if (recentTransactions.isEmpty)
                 const _EmptyLine(
                   'Ready when you are.',
                   'Your ledger fills up as you add transactions.',
                 )
               else
-                ...store.sortedTransactions
-                    .take(3)
-                    .map(
-                      (t) => TransactionTile(
-                        transaction: t,
-                        privacy: store.privacy,
-                        privacyStyle: store.privacyStyle,
-                      ),
-                    ),
+                ...recentTransactions.map(
+                  (t) => TransactionTile(
+                    transaction: t,
+                    privacy: store.privacy,
+                    privacyStyle: store.privacyStyle,
+                  ),
+                ),
             ],
           ),
         ),
@@ -1420,7 +1879,7 @@ class _SoftCard extends StatelessWidget {
       tween: Tween(begin: reduceMotion ? 1 : .0, end: 1),
       duration: reduceMotion
           ? Duration.zero
-          : const Duration(milliseconds: 380),
+          : const Duration(milliseconds: 320),
       curve: Curves.easeOutCubic,
       builder: (context, v, child) => Opacity(
         opacity: v,
@@ -1429,16 +1888,18 @@ class _SoftCard extends StatelessWidget {
           child: child,
         ),
       ),
-      child: Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: tint ?? Theme.of(context).colorScheme.surface,
+      // A Material (not a decorated Container) so list tiles inside the card
+      // paint their ink splashes instead of asserting about a hidden surface.
+      child: Material(
+        color: tint ?? Theme.of(context).colorScheme.surface,
+        shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(
+          side: BorderSide(
             color: Theme.of(context).dividerColor.withValues(alpha: .55),
           ),
         ),
-        child: child,
+        clipBehavior: Clip.antiAlias,
+        child: Padding(padding: const EdgeInsets.all(16), child: child),
       ),
     );
   }
@@ -1565,7 +2026,7 @@ class _SlotDigitState extends State<_SlotDigit>
     super.initState();
     _controller = AnimationController(
       vsync: this,
-      duration: Duration(milliseconds: 1300 + widget.index % 3 * 120),
+      duration: Duration(milliseconds: 980 + widget.index % 3 * 90),
     );
   }
 
@@ -1578,7 +2039,7 @@ class _SlotDigitState extends State<_SlotDigit>
       _controller.value = 1;
     } else if (!_started) {
       _started = true;
-      _delay = Timer(Duration(milliseconds: 50 * widget.index), () {
+      _delay = Timer(Duration(milliseconds: 36 * widget.index), () {
         if (mounted) _controller.forward();
       });
     }
@@ -1603,16 +2064,23 @@ class _SlotDigitState extends State<_SlotDigit>
         height: line,
         child: AnimatedBuilder(
           animation: _controller,
-          builder: (context, _) => Transform.translate(
-            offset: Offset(0, -_controller.value * end * line),
-            child: Column(
+          builder: (context, _) {
+            final position =
+                Curves.easeOutCubic.transform(_controller.value) * end;
+            final current = position.floor();
+            final fraction = position - current;
+            return Stack(
+              clipBehavior: Clip.hardEdge,
               children: [
-                for (var i = 0; i <= end; i++)
-                  SizedBox(
+                for (var offset = -1; offset <= 1; offset++)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    top: (offset - fraction) * line,
                     height: line,
                     child: Center(
                       child: Text(
-                        '${i % 10}',
+                        '${(current + offset) % 10}',
                         style: const TextStyle(
                           fontSize: font,
                           height: 1,
@@ -1623,8 +2091,8 @@ class _SlotDigitState extends State<_SlotDigit>
                     ),
                   ),
               ],
-            ),
-          ),
+            );
+          },
         ),
       ),
     );
@@ -1666,6 +2134,7 @@ class TransactionTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final income = transaction['type'] == 'income';
+    final hidden = transaction['hidden'] == true;
     final date = DateTime.tryParse('${transaction['date']}');
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
@@ -1680,10 +2149,16 @@ class TransactionTile extends StatelessWidget {
                   .withValues(alpha: .6),
               borderRadius: BorderRadius.circular(11),
             ),
-            child: Text(
-              categoryIcon('${transaction['category']}'),
-              style: const TextStyle(fontSize: 16),
-            ),
+            child: hidden
+                ? Icon(
+                    Icons.lock_outline_rounded,
+                    size: 17,
+                    color: Theme.of(context).colorScheme.primary,
+                  )
+                : Text(
+                    categoryIcon('${transaction['category']}'),
+                    style: const TextStyle(fontSize: 16),
+                  ),
           ),
           const SizedBox(width: 10),
           Expanded(
@@ -1691,7 +2166,9 @@ class TransactionTile extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '${transaction['description'] ?? transaction['category']}',
+                  hidden
+                      ? 'Hidden transaction'
+                      : '${transaction['description'] ?? transaction['category']}',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
@@ -1701,7 +2178,9 @@ class TransactionTile extends StatelessWidget {
                 ),
                 const SizedBox(height: 3),
                 Text(
-                  '${transaction['category'] ?? 'Other'}${transaction['recurring'] == true ? ' · recurring' : ''} · ${date == null ? '' : DateFormat('d MMM').format(date)}',
+                  hidden
+                      ? 'Hidden · ${date == null ? '' : DateFormat('d MMM').format(date)}'
+                      : '${transaction['category'] ?? 'Other'}${transaction['recurring'] == true ? ' · recurring' : ''} · ${date == null ? '' : DateFormat('d MMM').format(date)}',
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
@@ -1713,19 +2192,20 @@ class TransactionTile extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 8),
-          _SensitiveValue(
-            hidden: privacy,
-            privacyStyle: privacyStyle,
-            mask: '${income ? '+' : '−'}₹••••',
-            style: TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.w600,
-              color: income
-                  ? _incomeGreen
-                  : Theme.of(context).colorScheme.onSurface,
-            ),
-            child: Text(
-              '${income ? '+' : '−'}${money(PaisaStore.numberForUi(transaction['amount']))}',
+          if (hidden)
+            Text(
+              '₹ ••••',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: Theme.of(context).hintColor,
+              ),
+            )
+          else
+            _SensitiveValue(
+              hidden: privacy,
+              privacyStyle: privacyStyle,
+              mask: '${income ? '+' : '−'}₹••••',
               style: TextStyle(
                 fontSize: 11,
                 fontWeight: FontWeight.w600,
@@ -1733,8 +2213,17 @@ class TransactionTile extends StatelessWidget {
                     ? _incomeGreen
                     : Theme.of(context).colorScheme.onSurface,
               ),
+              child: Text(
+                '${income ? '+' : '−'}${money(PaisaStore.numberForUi(transaction['amount']))}',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: income
+                      ? _incomeGreen
+                      : Theme.of(context).colorScheme.onSurface,
+                ),
+              ),
             ),
-          ),
         ],
       ),
     );
@@ -1752,13 +2241,65 @@ class ActivityScreen extends StatefulWidget {
 class _ActivityScreenState extends State<ActivityScreen> {
   String _query = '';
   String _type = 'All';
+
+  Future<void> _toggleHidden(Map<String, dynamic> transaction) async {
+    final hidden = transaction['hidden'] == true;
+    try {
+      if (hidden) {
+        if (!await _verifyPrivacyPin(context, widget.store)) return;
+      } else if (!await widget.store.hasPrivacyPin()) {
+        if (!await _createPrivacyPin(context, widget.store)) return;
+      }
+      if (!mounted) return;
+      await widget.store.setTransactionHidden('${transaction['id']}', !hidden);
+    } on PlatformException catch (error) {
+      debugPrint('Paisa hidden transaction update failed: ${error.code}');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              error.code == 'PRIVACY_SECURITY_ERROR'
+                  ? 'Secure storage could not unlock this transaction. Its data is unchanged.'
+                  : 'Secure storage could not update this transaction.',
+            ),
+          ),
+        );
+      }
+    } on UnsupportedError catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Hidden transactions need Android secure storage.'),
+          ),
+        );
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Paisa hidden transaction update failed: $error\n$stackTrace');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Could not unlock this transaction. Its data is unchanged.',
+            ),
+          ),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final list = widget.store.sortedTransactions
         .where(
           (t) =>
-              (_type == 'All' || t['type'] == _type.toLowerCase()) &&
-              ('${t['description']} ${t['category']} ${t['notes']}'
+              (_type == 'All' ||
+                  (_type == 'Hidden'
+                      ? t['hidden'] == true
+                      : t['hidden'] != true &&
+                            t['type'] == _type.toLowerCase())) &&
+              ((t['hidden'] == true
+                      ? 'hidden transaction ${t['date']}'
+                      : '${t['description']} ${t['category']} ${t['notes']}')
                   .toLowerCase()
                   .contains(_query.toLowerCase())),
         )
@@ -1777,7 +2318,7 @@ class _ActivityScreenState extends State<ActivityScreen> {
         const SizedBox(height: 9),
         Wrap(
           spacing: 7,
-          children: ['All', 'Expense', 'Income']
+          children: ['All', 'Expense', 'Income', 'Hidden']
               .map(
                 (t) => ChoiceChip(
                   label: Text(t),
@@ -1798,7 +2339,9 @@ class _ActivityScreenState extends State<ActivityScreen> {
                   children: [
                     for (final t in list)
                       InkWell(
-                        onTap: () => widget.onEdit(t),
+                        onTap: t['hidden'] == true
+                            ? null
+                            : () => widget.onEdit(t),
                         child: Padding(
                           padding: const EdgeInsets.symmetric(vertical: 3),
                           child: Row(
@@ -1812,23 +2355,44 @@ class _ActivityScreenState extends State<ActivityScreen> {
                               ),
                               PopupMenuButton<String>(
                                 iconSize: 18,
-                                itemBuilder: (_) => const [
-                                  PopupMenuItem(
-                                    value: 'edit',
-                                    child: Text('Edit'),
-                                  ),
-                                  PopupMenuItem(
+                                itemBuilder: (_) => [
+                                  if (t['hidden'] == true)
+                                    const PopupMenuItem(
+                                      value: 'show',
+                                      child: Text('Show transaction · PIN'),
+                                    )
+                                  else ...[
+                                    const PopupMenuItem(
+                                      value: 'edit',
+                                      child: Text('Edit'),
+                                    ),
+                                    const PopupMenuItem(
+                                      value: 'hide',
+                                      child: Text('Hide transaction'),
+                                    ),
+                                  ],
+                                  const PopupMenuItem(
                                     value: 'delete',
                                     child: Text('Delete'),
                                   ),
                                 ],
                                 onSelected: (v) async {
-                                  if (v == 'edit')
-                                    widget.onEdit(t);
-                                  else
+                                  if (v == 'hide' || v == 'show') {
+                                    await _toggleHidden(t);
+                                  } else if (v == 'delete') {
+                                    if (t['hidden'] == true &&
+                                        !await _verifyPrivacyPin(
+                                          context,
+                                          widget.store,
+                                        )) {
+                                      return;
+                                    }
                                     await widget.store.deleteTransaction(
                                       '${t['id']}',
                                     );
+                                  } else if (v == 'edit') {
+                                    widget.onEdit(t);
+                                  }
                                 },
                               ),
                             ],
@@ -1951,7 +2515,7 @@ class _CampusScreenState extends State<CampusScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const _Eyebrow('VIT MENU · SAMPLE DATA'),
+                    const _Eyebrow('CAMPUS MENU'),
                     const SizedBox(height: 6),
                     const Text(
                       'A craving, with a price tag.',
@@ -1963,7 +2527,7 @@ class _CampusScreenState extends State<CampusScreen> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      'Sample menus until you send the real ones.',
+                      'The places and prices around campus.',
                       style: TextStyle(
                         color: Theme.of(context).hintColor,
                         fontSize: 10,
@@ -2118,7 +2682,7 @@ class _CampusScreenState extends State<CampusScreen> {
                   ),
                   _OnDeviceTag(
                     color: Theme.of(context).colorScheme.primary,
-                    label: 'SAMPLE',
+                    label: 'MENU',
                   ),
                 ],
               ),
@@ -2242,11 +2806,6 @@ class _CampusScreenState extends State<CampusScreen> {
             ],
           ),
         ),
-        const SizedBox(height: 12),
-        Text(
-          'Sample VIT places and prices only. Replace with verified menus when you have them.',
-          style: TextStyle(fontSize: 9, color: Theme.of(context).hintColor),
-        ),
       ],
     );
   }
@@ -2350,7 +2909,7 @@ class _ShopOption extends StatelessWidget {
                   ),
                 ),
                 Text(
-                  '${(shop['items'] as List).length} sample menu items',
+                  '${(shop['items'] as List).length} menu items',
                   style: TextStyle(
                     fontSize: 9,
                     color: Theme.of(context).hintColor,
@@ -2795,17 +3354,16 @@ class BudgetsScreen extends StatelessWidget {
         ),
       ),
     );
-    controller.dispose();
+    _disposeDialogControllers([controller]);
     if (result != null) await store.saveBudget(result.key, result.value);
   }
 
   @override
   Widget build(BuildContext context) {
     final entries = store.budgets.entries.toList();
-    final spent = entries.fold<double>(
-      0,
-      (s, e) => s + store.categorySpend(e.key),
-    );
+    final currentMonth = store.monthTransactions;
+    final spent = store.total('expense', currentMonth);
+    final hiddenSpent = store.hiddenMonthlyExpenseTotal;
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 15, 16, 28),
       children: [
@@ -2847,6 +3405,57 @@ class BudgetsScreen extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 10),
+        if (hiddenSpent > 0) ...[
+          _SoftCard(
+            child: Row(
+              children: [
+                Icon(
+                  Icons.lock_outline_rounded,
+                  size: 17,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
+                const SizedBox(width: 9),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Hidden transactions',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      Text(
+                        'Included in totals · category kept private',
+                        style: TextStyle(
+                          color: Theme.of(context).hintColor,
+                          fontSize: 9,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                _SensitiveValue(
+                  store: store,
+                  mask: '₹ ••••',
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                  child: Text(
+                    money(hiddenSpent),
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 9),
+        ],
         for (final entry in entries)
           _BudgetTile(
             category: entry.key,
@@ -2995,9 +3604,12 @@ class InsightsScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final month = store.monthTransactions;
-    final spend = store.total('expense', month);
+    final visibleMonth = month
+        .where((transaction) => transaction['hidden'] != true)
+        .toList();
+    final spend = store.total('expense', visibleMonth);
     final byCategory = <String, double>{};
-    for (final t in month.where((t) => t['type'] == 'expense')) {
+    for (final t in visibleMonth.where((t) => t['type'] == 'expense')) {
       final c = '${t['category'] ?? 'Miscellaneous'}';
       byCategory[c] =
           (byCategory[c] ?? 0) + PaisaStore.numberForUi(t['amount']);
@@ -3040,6 +3652,8 @@ class InsightsScreen extends StatelessWidget {
         ),
         const SizedBox(height: 10),
         _WalletEntryCard(onTap: () => _openWallet(context, store, onPage)),
+        const SizedBox(height: 10),
+        _PriceMemoryEntryCard(onTap: () => _openPriceMemory(context, store)),
         const SizedBox(height: 10),
         _SoftCard(
           child: Column(
@@ -3101,40 +3715,710 @@ class InsightsScreen extends StatelessWidget {
         ),
         const SizedBox(height: 10),
         _SoftCard(
-          child: Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'Monthly Wrapped',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w700,
+          child: InkWell(
+            onTap: () => _openWrapped(context, store),
+            borderRadius: BorderRadius.circular(10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Monthly Wrapped',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      'A small recap of what your ledger says.',
-                      style: TextStyle(
-                        fontSize: 10,
-                        color: Theme.of(context).hintColor,
+                      const SizedBox(height: 3),
+                      Text(
+                        'A small recap of what your ledger says.',
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: Theme.of(context).hintColor,
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-              FilledButton.tonal(
-                onPressed: () => _openWrapped(context, store),
-                child: const Text('Open'),
-              ),
-            ],
+                FilledButton.tonal(
+                  onPressed: () => _openWrapped(context, store),
+                  child: const Text('Open'),
+                ),
+              ],
+            ),
           ),
         ),
       ],
     );
   }
+}
+
+class _PriceMemoryEntryCard extends StatelessWidget {
+  const _PriceMemoryEntryCard({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) => _SoftCard(
+    child: Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Price Memory',
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 3),
+              Text(
+                'The prices you have actually logged.',
+                style: TextStyle(
+                  color: Theme.of(context).hintColor,
+                  fontSize: 10,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 8),
+        FilledButton.tonal(
+          onPressed: onTap,
+          style: FilledButton.styleFrom(visualDensity: VisualDensity.compact),
+          child: const Text('Open'),
+        ),
+      ],
+    ),
+  );
+}
+
+Future<void> _openPriceMemory(BuildContext context, PaisaStore store) =>
+    Navigator.of(context).push<void>(
+      PageRouteBuilder<void>(
+        transitionDuration: store.reduceMotion
+            ? Duration.zero
+            : const Duration(milliseconds: 340),
+        reverseTransitionDuration: store.reduceMotion
+            ? Duration.zero
+            : const Duration(milliseconds: 260),
+        pageBuilder: (_, _, _) => _PriceMemoryScreen(store: store),
+        transitionsBuilder: (_, animation, secondaryAnimation, child) {
+          if (store.reduceMotion) return child;
+          final curved = CurvedAnimation(
+            parent: animation,
+            curve: Curves.easeOutCubic,
+            reverseCurve: Curves.easeInCubic,
+          );
+          return FadeTransition(
+            opacity: curved,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(.035, 0),
+                end: Offset.zero,
+              ).animate(curved),
+              child: child,
+            ),
+          );
+        },
+      ),
+    );
+
+class _PriceMemoryScreen extends StatefulWidget {
+  const _PriceMemoryScreen({required this.store});
+  final PaisaStore store;
+
+  @override
+  State<_PriceMemoryScreen> createState() => _PriceMemoryScreenState();
+}
+
+class _PriceMemoryScreenState extends State<_PriceMemoryScreen> {
+  final _search = TextEditingController();
+  String _filter = 'All';
+  String _query = '';
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  bool _matchesFilter(PriceMemoryEntry entry) {
+    final text = '${entry.category} ${entry.item} ${entry.place}'.toLowerCase();
+    return switch (_filter) {
+      'Food' =>
+        text.contains('food') ||
+            text.contains('snack') ||
+            text.contains('meal'),
+      'Printing' => text.contains('print'),
+      'Laundry' => text.contains('laundry'),
+      'Transport' =>
+        text.contains('transport') ||
+            text.contains('ride') ||
+            text.contains('auto'),
+      _ => true,
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(
+      leading: IconButton(
+        tooltip: 'Back to Insights',
+        onPressed: () => Navigator.of(context).maybePop(),
+        icon: const Icon(Icons.arrow_back_rounded),
+      ),
+      title: const Text('Price Memory'),
+      centerTitle: true,
+    ),
+    body: AnimatedBuilder(
+      animation: widget.store,
+      builder: (context, _) {
+        final entries = widget.store.priceMemoryEntries.where((entry) {
+          final matchesText = '${entry.item} ${entry.place} ${entry.category}'
+              .toLowerCase()
+              .contains(_query.toLowerCase());
+          return matchesText && _matchesFilter(entry);
+        }).toList();
+        final allEmpty = widget.store.priceMemoryEntries.isEmpty;
+        return ListView(
+          padding: const EdgeInsets.fromLTRB(16, 15, 16, 30),
+          children: [
+            const _PageHeading(
+              'Price Memory',
+              'Prices you have actually logged. Yours to keep track of.',
+            ),
+            TextField(
+              controller: _search,
+              onChanged: (value) => setState(() => _query = value.trim()),
+              decoration: InputDecoration(
+                hintText: 'Find an item or place',
+                prefixIcon: const Icon(Icons.search_rounded),
+                suffixIcon: _query.isEmpty
+                    ? null
+                    : IconButton(
+                        tooltip: 'Clear search',
+                        onPressed: () {
+                          _search.clear();
+                          setState(() => _query = '');
+                        },
+                        icon: const Icon(Icons.close_rounded),
+                      ),
+              ),
+            ),
+            const SizedBox(height: 9),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (final filter in const [
+                    'All',
+                    'Food',
+                    'Printing',
+                    'Laundry',
+                    'Transport',
+                  ]) ...[
+                    if (filter != 'All') const SizedBox(width: 6),
+                    ChoiceChip(
+                      label: Text(filter),
+                      selected: _filter == filter,
+                      onSelected: (_) => setState(() => _filter = filter),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(height: 10),
+            if (allEmpty)
+              const _SoftCard(
+                child: _EmptyLine(
+                  'Your first price is waiting.',
+                  'When you add an expense, turn on “Remember this price” and give the item a name. Campus dishes you select are remembered automatically.',
+                ),
+              )
+            else if (entries.isEmpty)
+              _SoftCard(
+                child: _EmptyLine(
+                  'Nothing matches that search.',
+                  'Try another item, place, or category.',
+                ),
+              )
+            else
+              for (final entry in entries) ...[
+                _PriceMemoryCard(
+                  entry: entry,
+                  store: widget.store,
+                  allEntries: widget.store.priceMemoryEntries,
+                ),
+                const SizedBox(height: 9),
+              ],
+            const SizedBox(height: 3),
+            Text(
+              'Your logged prices only · not live or verified shop prices',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Theme.of(context).hintColor, fontSize: 9),
+            ),
+          ],
+        );
+      },
+    ),
+  );
+}
+
+class _PriceMemoryCard extends StatefulWidget {
+  const _PriceMemoryCard({
+    required this.entry,
+    required this.store,
+    required this.allEntries,
+  });
+  final PriceMemoryEntry entry;
+  final PaisaStore store;
+  final List<PriceMemoryEntry> allEntries;
+
+  @override
+  State<_PriceMemoryCard> createState() => _PriceMemoryCardState();
+}
+
+class _PriceMemoryCardState extends State<_PriceMemoryCard> {
+  bool _historyOpen = false;
+
+  Future<void> _editLabels() async {
+    final item = TextEditingController(text: widget.entry.item);
+    final place = TextEditingController(text: widget.entry.place);
+    final result = await showDialog<(String, String)>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Edit remembered label'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: item,
+              autofocus: true,
+              maxLength: 80,
+              textCapitalization: TextCapitalization.sentences,
+              decoration: const InputDecoration(labelText: 'Item or service'),
+            ),
+            TextField(
+              controller: place,
+              maxLength: 80,
+              textCapitalization: TextCapitalization.words,
+              decoration: const InputDecoration(labelText: 'Place (optional)'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () {
+              if (item.text.trim().isEmpty) return;
+              Navigator.pop(context, (item.text.trim(), place.text.trim()));
+            },
+            child: const Text('Save labels'),
+          ),
+        ],
+      ),
+    );
+    _disposeDialogControllers([item, place]);
+    if (result == null || !mounted) return;
+    await widget.store.renamePriceMemoryEntry(
+      widget.entry.transactions.map((transaction) => '${transaction['id']}'),
+      item: result.$1,
+      place: result.$2,
+    );
+  }
+
+  Future<void> _removeEntry() async {
+    final remove = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Remove from Price Memory?'),
+        content: const Text(
+          'This hides the remembered prices. Your expense transactions will stay in Activity.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Keep it'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (remove != true || !mounted) return;
+    await widget.store.removePriceMemoryEntry(
+      widget.entry.transactions.map((transaction) => '${transaction['id']}'),
+    );
+  }
+
+  String _comparison() {
+    final previous = widget.entry.previous;
+    if (previous == null) return 'First price saved';
+    final currentAmount = PaisaStore.numberForUi(widget.entry.latest['amount']);
+    final previousAmount = PaisaStore.numberForUi(previous['amount']);
+    final difference = currentAmount - previousAmount;
+    if (difference == 0) return 'Same as last time';
+    if (widget.store.privacy) return 'Different from last time';
+    return '${money(difference.abs())} ${difference > 0 ? 'more' : 'less'} than last time';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final entry = widget.entry;
+    final accent = Theme.of(context).colorScheme.primary;
+    final latestDate = DateTime.tryParse('${entry.latest['date']}');
+    final values = entry.transactions
+        .take(5)
+        .toList()
+        .reversed
+        .map((transaction) => PaisaStore.numberForUi(transaction['amount']))
+        .toList();
+    final latestAmount = PaisaStore.numberForUi(entry.latest['amount']);
+    final lowerAtAnotherPlace =
+        widget.allEntries
+            .where(
+              (candidate) =>
+                  candidate.item.trim().toLowerCase() ==
+                      entry.item.trim().toLowerCase() &&
+                  candidate.place.trim().toLowerCase() !=
+                      entry.place.trim().toLowerCase() &&
+                  candidate.place.isNotEmpty &&
+                  PaisaStore.numberForUi(candidate.latest['amount']) <
+                      latestAmount,
+            )
+            .toList()
+          ..sort(
+            (a, b) =>
+                PaisaStore.numberForUi(a.latest['amount'])
+                    .compareTo(PaisaStore.numberForUi(b.latest['amount'])),
+          );
+    final menu = <PopupMenuEntry<String>>[
+      const PopupMenuItem(value: 'edit', child: Text('Edit item / place')),
+      const PopupMenuItem(value: 'remove', child: Text('Remove from memory')),
+    ];
+    return _SoftCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _Eyebrow(entry.category.toUpperCase()),
+                    const SizedBox(height: 3),
+                    Text(
+                      entry.item,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    if (entry.place.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        entry.place,
+                        style: TextStyle(
+                          color: Theme.of(context).hintColor,
+                          fontSize: 10,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              PopupMenuButton<String>(
+                tooltip: 'Price Memory options',
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 190),
+                onSelected: (value) =>
+                    value == 'edit' ? _editLabels() : _removeEntry(),
+                itemBuilder: (_) => menu,
+                icon: Icon(
+                  Icons.more_horiz_rounded,
+                  color: Theme.of(context).hintColor,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'MOST RECENT',
+                      style: TextStyle(
+                        color: Theme.of(context).hintColor,
+                        fontSize: 8,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: .7,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    _SensitiveValue(
+                      store: widget.store,
+                      mask: '₹ ••••',
+                      style: const TextStyle(
+                        fontSize: 21,
+                        fontWeight: FontWeight.w800,
+                      ),
+                      child: Text(
+                        money(PaisaStore.numberForUi(entry.latest['amount'])),
+                        style: const TextStyle(
+                          fontSize: 21,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                    if (latestDate != null)
+                      Text(
+                        DateFormat('d MMM yyyy').format(latestDate),
+                        style: TextStyle(
+                          color: Theme.of(context).hintColor,
+                          fontSize: 9,
+                        ),
+                      ),
+                    if (entry.previous != null) ...[
+                      const SizedBox(height: 3),
+                      Row(
+                        children: [
+                          Text(
+                            'Previous · ',
+                            style: TextStyle(
+                              color: Theme.of(context).hintColor,
+                              fontSize: 9,
+                            ),
+                          ),
+                          _SensitiveValue(
+                            store: widget.store,
+                            mask: '₹ ••••',
+                            style: TextStyle(
+                              color: Theme.of(context).hintColor,
+                              fontSize: 9,
+                            ),
+                            child: Text(
+                              money(
+                                PaisaStore.numberForUi(
+                                  entry.previous!['amount'],
+                                ),
+                              ),
+                              style: TextStyle(
+                                color: Theme.of(context).hintColor,
+                                fontSize: 9,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              if (values.length > 1)
+                SizedBox(
+                  width: 73,
+                  height: 34,
+                  child: CustomPaint(
+                    painter: _PriceTrendPainter(values: values, color: accent),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  _comparison(),
+                  style: TextStyle(
+                    color: Theme.of(context).hintColor,
+                    fontSize: 10,
+                  ),
+                ),
+              ),
+              Text(
+                '${entry.transactions.length} ${entry.transactions.length == 1 ? 'record' : 'records'}',
+                style: TextStyle(
+                  color: Theme.of(context).hintColor,
+                  fontSize: 9,
+                ),
+              ),
+            ],
+          ),
+          if (lowerAtAnotherPlace.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Wrap(
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 2,
+              children: [
+                Text(
+                  'You logged this for',
+                  style: TextStyle(
+                    color: Theme.of(context).hintColor,
+                    fontSize: 9,
+                  ),
+                ),
+                _SensitiveValue(
+                  store: widget.store,
+                  mask: '₹ •••',
+                  style: TextStyle(
+                    color: Theme.of(context).hintColor,
+                    fontSize: 9,
+                  ),
+                  child: Text(
+                    money(
+                      PaisaStore.numberForUi(
+                        lowerAtAnotherPlace.first.latest['amount'],
+                      ),
+                    ),
+                    style: TextStyle(
+                      color: Theme.of(context).hintColor,
+                      fontSize: 9,
+                    ),
+                  ),
+                ),
+                Text(
+                  'at ${lowerAtAnotherPlace.first.place}.',
+                  style: TextStyle(
+                    color: Theme.of(context).hintColor,
+                    fontSize: 9,
+                  ),
+                ),
+              ],
+            ),
+          ],
+          if (entry.transactions.length > 1) ...[
+            const SizedBox(height: 4),
+            TextButton(
+              style: TextButton.styleFrom(
+                padding: EdgeInsets.zero,
+                minimumSize: const Size(0, 30),
+                alignment: Alignment.centerLeft,
+              ),
+              onPressed: () => setState(() => _historyOpen = !_historyOpen),
+              child: Text(
+                _historyOpen ? 'Hide price history' : 'See price history',
+              ),
+            ),
+            AnimatedSize(
+              duration: widget.store.reduceMotion
+                  ? Duration.zero
+                  : const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              child: !_historyOpen
+                  ? const SizedBox.shrink()
+                  : Column(
+                      children: [
+                        for (final transaction in entry.transactions)
+                          _PriceHistoryRow(
+                            transaction: transaction,
+                            store: widget.store,
+                          ),
+                      ],
+                    ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _PriceHistoryRow extends StatelessWidget {
+  const _PriceHistoryRow({required this.transaction, required this.store});
+  final Map<String, dynamic> transaction;
+  final PaisaStore store;
+
+  @override
+  Widget build(BuildContext context) {
+    final date = DateTime.tryParse('${transaction['date']}');
+    final style = TextStyle(color: Theme.of(context).hintColor, fontSize: 9);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              date == null
+                  ? 'Date not available'
+                  : DateFormat('d MMM yyyy').format(date),
+              style: style,
+            ),
+          ),
+          _SensitiveValue(
+            store: store,
+            mask: '₹ ••••',
+            style: style,
+            child: Text(
+              money(PaisaStore.numberForUi(transaction['amount'])),
+              style: style,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _PriceTrendPainter extends CustomPainter {
+  const _PriceTrendPainter({required this.values, required this.color});
+  final List<double> values;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (values.length < 2) return;
+    final minimum = values.reduce(math.min);
+    final maximum = values.reduce(math.max);
+    final range = maximum - minimum;
+    final points = <Offset>[];
+    for (var index = 0; index < values.length; index++) {
+      final x = size.width * index / (values.length - 1);
+      final y = range == 0
+          ? size.height * .5
+          : size.height - (values[index] - minimum) / range * size.height;
+      points.add(Offset(x, y));
+    }
+    final path = Path()..moveTo(points.first.dx, points.first.dy);
+    for (final point in points.skip(1)) {
+      path.lineTo(point.dx, point.dy);
+    }
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = color.withValues(alpha: .75)
+        ..strokeWidth = 1.6
+        ..strokeCap = StrokeCap.round
+        ..strokeJoin = StrokeJoin.round
+        ..style = PaintingStyle.stroke,
+    );
+    for (var index = 0; index < points.length; index++) {
+      canvas.drawCircle(
+        points[index],
+        index == points.length - 1 ? 2.3 : 1.5,
+        Paint()
+          ..color = color.withValues(
+            alpha: index == points.length - 1 ? 1 : .65,
+          ),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _PriceTrendPainter oldDelegate) =>
+      oldDelegate.values != values || oldDelegate.color != color;
 }
 
 class _WalletEntryCard extends StatelessWidget {
@@ -3247,7 +4531,7 @@ class _WalletScreenState extends State<_WalletScreen>
     super.initState();
     _arrival = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1450),
+      duration: const Duration(milliseconds: 1100),
       value: widget.store.reduceMotion ? 1 : 0,
     );
     if (!widget.store.reduceMotion) _arrival.forward();
@@ -4030,12 +5314,12 @@ class _CashFlowChart extends StatelessWidget {
       );
       income.add(
         items
-            .where((t) => t['type'] == 'income')
+            .where((t) => t['type'] == 'income' && t['hidden'] != true)
             .fold<double>(0, (s, t) => s + PaisaStore.numberForUi(t['amount'])),
       );
       expenses.add(
         items
-            .where((t) => t['type'] == 'expense')
+            .where((t) => t['type'] == 'expense' && t['hidden'] != true)
             .fold<double>(0, (s, t) => s + PaisaStore.numberForUi(t['amount'])),
       );
     }
@@ -4133,7 +5417,7 @@ class _MonthlyWrappedScreen extends StatefulWidget {
 }
 
 class _MonthlyWrappedScreenState extends State<_MonthlyWrappedScreen>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
   late final AnimationController _reveal;
   late final AnimationController _selectionMotion;
   int? _selectedIndex;
@@ -4144,7 +5428,7 @@ class _MonthlyWrappedScreenState extends State<_MonthlyWrappedScreen>
     super.initState();
     _reveal = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1550),
+      duration: const Duration(milliseconds: 1150),
     );
     _selectionMotion = AnimationController(
       vsync: this,
@@ -4169,10 +5453,13 @@ class _MonthlyWrappedScreenState extends State<_MonthlyWrappedScreen>
     for (final transaction in widget.store.monthTransactions.where(
       (t) => t['type'] == 'expense',
     )) {
-      final category = '${transaction['category'] ?? 'Miscellaneous'}';
-      totals[category] =
-          (totals[category] ?? 0) +
-          PaisaStore.numberForUi(transaction['amount']);
+      final amount = PaisaStore.numberForUi(transaction['amount']);
+      if (!amount.isFinite || amount <= 0) continue;
+      final category = transaction['hidden'] == true
+          ? 'Hidden'
+          : '${transaction['category'] ?? 'Miscellaneous'}';
+      final nextTotal = (totals[category] ?? 0) + amount;
+      if (nextTotal.isFinite) totals[category] = nextTotal;
     }
     final entries = totals.entries.toList()
       ..sort((a, b) => b.value.compareTo(a.value));
@@ -4205,6 +5492,7 @@ class _MonthlyWrappedScreenState extends State<_MonthlyWrappedScreen>
     if (angle < 0) angle += math.pi * 2;
     final target = angle / (math.pi * 2);
     final total = slices.fold<double>(0, (sum, slice) => sum + slice.amount);
+    if (!total.isFinite || total <= 0) return;
     var cumulative = 0.0;
     for (var i = 0; i < slices.length; i++) {
       cumulative += slices[i].amount / total;
@@ -4216,7 +5504,7 @@ class _MonthlyWrappedScreenState extends State<_MonthlyWrappedScreen>
   }
 
   void _changeSelection(int index) {
-    if (_selectedIndex == index) return;
+    if (_selectedIndex == index || index < 0) return;
     setState(() {
       _previousSelectedIndex = _selectedIndex;
       _selectedIndex = index;
@@ -4247,6 +5535,10 @@ class _MonthlyWrappedScreenState extends State<_MonthlyWrappedScreen>
           (sum, slice) => sum + slice.amount,
         );
         final entries = widget.store.monthTransactions;
+        final visibleEntryCount = entries
+            .where((transaction) => transaction['hidden'] != true)
+            .length;
+        final hasHiddenEntries = visibleEntryCount != entries.length;
         final selected =
             _selectedIndex != null && _selectedIndex! < slices.length
             ? slices[_selectedIndex!]
@@ -4287,7 +5579,9 @@ class _MonthlyWrappedScreenState extends State<_MonthlyWrappedScreen>
                         ),
                         const SizedBox(height: 3),
                         Text(
-                          '${entries.length} ledger entries · tap a slice to peek',
+                          hasHiddenEntries
+                              ? 'Hidden spending stays grouped · tap a slice to peek'
+                              : '$visibleEntryCount ledger entries · tap a slice to peek',
                           style: TextStyle(
                             color: Theme.of(context).hintColor,
                             fontSize: 10,
@@ -4562,6 +5856,7 @@ class _WrappedPiePainter extends CustomPainter {
       return;
     }
     final total = slices.fold<double>(0, (sum, slice) => sum + slice.amount);
+    if (!total.isFinite || total <= 0) return;
     var cumulative = 0.0;
     for (var i = 0; i < slices.length; i++) {
       final slice = slices[i];
@@ -4587,6 +5882,7 @@ class _WrappedPiePainter extends CustomPainter {
       final arcRect = Rect.fromCircle(center: center, radius: arcRadius);
       final arcStart = start + gap / 2;
       final arcSweep = math.max(0.0, sweep - gap);
+      if (arcSweep <= 0) continue;
       if (emphasis > 0) {
         canvas.drawArc(
           arcRect,
@@ -4714,8 +6010,6 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  late final TextEditingController _opening;
-  late final TextEditingController _monthly;
   late final TextEditingController _recAmount;
   late final TextEditingController _recLabel;
   late DateTime _nextDate;
@@ -4725,8 +6019,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void initState() {
     super.initState();
     final s = widget.store;
-    _opening = TextEditingController(text: '${s.openingBalance}');
-    _monthly = TextEditingController(text: '${s.monthlyIncome}');
     _recAmount = TextEditingController(
       text: '${s.recurringIncome['amount'] ?? ''}',
     );
@@ -4741,8 +6033,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   void dispose() {
-    _opening.dispose();
-    _monthly.dispose();
     _recAmount.dispose();
     _recLabel.dispose();
     super.dispose();
@@ -4751,6 +6041,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void _notice(String text) =>
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   Future<void> _exportCsv() async {
+    if (widget.store.hiddenTransactions.isNotEmpty &&
+        !await _verifyPrivacyPin(context, widget.store)) {
+      return;
+    }
     String quote(Object? value) =>
         '"${'${value ?? ''}'.replaceAll('"', '""')}"';
     final rows = <List<Object?>>[
@@ -4763,6 +6057,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
         'payment',
         'recurring',
         'notes',
+        'price_memory_item',
+        'price_memory_place',
+        'price_memory_ignored',
+        'is_hidden',
       ],
       ...widget.store.sortedTransactions.map(
         (t) => [
@@ -4774,6 +6072,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
           t['payment'],
           t['recurring'],
           t['notes'],
+          t['priceMemoryItem'],
+          t['priceMemoryPlace'],
+          t['priceMemoryIgnored'],
+          t['hidden'] == true,
         ],
       ),
     ];
@@ -4813,8 +6115,28 @@ class _SettingsScreenState extends State<SettingsScreen> {
           descCol = col(['description', 'merchant']),
           catCol = col(['category']),
           typeCol = col(['type']);
+      final memoryItemCol = col(['price_memory_item']),
+          memoryPlaceCol = col(['price_memory_place']),
+          memoryIgnoredCol = col(['price_memory_ignored']);
+      final hiddenCol = col(['is_hidden']);
       if (dateCol < 0 || amountCol < 0)
         return _notice('CSV needs Date and Amount columns.');
+      final containsHidden =
+          hiddenCol >= 0 &&
+          rows
+              .skip(1)
+              .any(
+                (row) =>
+                    row.length > hiddenCol &&
+                    row[hiddenCol].toLowerCase() == 'true',
+              );
+      if (containsHidden) {
+        if (await widget.store.hasPrivacyPin()) {
+          if (!await _verifyPrivacyPin(context, widget.store)) return;
+        } else if (!await _createPrivacyPin(context, widget.store)) {
+          return;
+        }
+      }
       var added = 0;
       for (final row in rows.skip(1)) {
         if (row.length <= math.max(dateCol, amountCol)) continue;
@@ -4843,6 +6165,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
           'description': description,
           'category': category,
           'notes': 'Imported CSV',
+          if (memoryItemCol >= 0 && row.length > memoryItemCol)
+            'priceMemoryItem': row[memoryItemCol],
+          if (memoryPlaceCol >= 0 && row.length > memoryPlaceCol)
+            'priceMemoryPlace': row[memoryPlaceCol],
+          if (memoryIgnoredCol >= 0 && row.length > memoryIgnoredCol)
+            'priceMemoryIgnored': row[memoryIgnoredCol].toLowerCase() == 'true',
+          if (hiddenCol >= 0 && row.length > hiddenCol)
+            'hidden': row[hiddenCol].toLowerCase() == 'true',
         });
         added++;
       }
@@ -4865,62 +6195,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       children: [
         const _PageHeading('More', 'Make Paisa feel like yours.'),
         _SettingsCard(
-          title: 'YOUR FINANCIAL BASELINE',
-          child: Column(
-            children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _opening,
-                      keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(
-                        labelText: 'Opening balance (₹)',
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 9),
-                  Expanded(
-                    child: TextField(
-                      controller: _monthly,
-                      keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(
-                        labelText: 'Expected monthly income (₹)',
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Align(
-                alignment: Alignment.centerRight,
-                child: FilledButton.tonal(
-                  onPressed: () async {
-                    final o = double.tryParse(_opening.text),
-                        m = double.tryParse(_monthly.text);
-                    if (o == null || o < 0 || m == null || m < 0)
-                      return _notice('Enter valid non-negative amounts.');
-                    await store.saveSettings(opening: o, income: m);
-                    _notice('Financial baseline saved.');
-                  },
-                  child: const Text('Save baseline'),
-                ),
-              ),
-              Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  'Balance = opening balance + income − expenses.',
-                  style: TextStyle(
-                    fontSize: 9,
-                    color: Theme.of(context).hintColor,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 9),
-        _SettingsCard(
           title: 'POCKET MONEY SCHEDULE',
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -4934,49 +6208,56 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
               const SizedBox(height: 10),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _recAmount,
-                      keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(
-                        labelText: 'Amount (₹)',
-                      ),
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final amountField = TextField(
+                    controller: _recAmount,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'Amount (₹)'),
+                  );
+                  final frequencyField = DropdownButtonFormField<String>(
+                    isExpanded: true,
+                    initialValue: _frequency,
+                    elevation: 16,
+                    dropdownColor: Theme.of(context).colorScheme.surface,
+                    borderRadius: BorderRadius.circular(18),
+                    menuMaxHeight: 260,
+                    icon: Icon(
+                      Icons.keyboard_arrow_down_rounded,
+                      color: Theme.of(context).colorScheme.primary,
                     ),
-                  ),
-                  const SizedBox(width: 9),
-                  Expanded(
-                    child: DropdownButtonFormField<String>(
-                      initialValue: _frequency,
-                      elevation: 16,
-                      dropdownColor: Theme.of(context).colorScheme.surface,
-                      borderRadius: BorderRadius.circular(18),
-                      menuMaxHeight: 260,
-                      icon: Icon(
-                        Icons.keyboard_arrow_down_rounded,
-                        color: Theme.of(context).colorScheme.primary,
+                    decoration: const InputDecoration(labelText: 'Every'),
+                    items: const [
+                      DropdownMenuItem(value: 'weekly', child: Text('Weekly')),
+                      DropdownMenuItem(
+                        value: 'fortnightly',
+                        child: Text('Fortnightly'),
                       ),
-                      decoration: const InputDecoration(labelText: 'Every'),
-                      items: const [
-                        DropdownMenuItem(
-                          value: 'weekly',
-                          child: Text('Every week  ·  7 days'),
-                        ),
-                        DropdownMenuItem(
-                          value: 'fortnightly',
-                          child: Text('Every 2 weeks  ·  14 days'),
-                        ),
-                        DropdownMenuItem(
-                          value: 'monthly',
-                          child: Text('Every month'),
-                        ),
+                      DropdownMenuItem(
+                        value: 'monthly',
+                        child: Text('Monthly'),
+                      ),
+                    ],
+                    onChanged: (v) =>
+                        setState(() => _frequency = v ?? 'monthly'),
+                  );
+                  if (constraints.maxWidth < 430) {
+                    return Column(
+                      children: [
+                        amountField,
+                        const SizedBox(height: 8),
+                        frequencyField,
                       ],
-                      onChanged: (v) =>
-                          setState(() => _frequency = v ?? 'monthly'),
-                    ),
-                  ),
-                ],
+                    );
+                  }
+                  return Row(
+                    children: [
+                      Expanded(child: amountField),
+                      const SizedBox(width: 9),
+                      Expanded(child: frequencyField),
+                    ],
+                  );
+                },
               ),
               const SizedBox(height: 9),
               OutlinedButton.icon(
@@ -5017,6 +6298,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
               Wrap(
                 spacing: 8,
+                runSpacing: 7,
                 children: [
                   FilledButton.tonal(
                     onPressed: () async {
@@ -5182,6 +6464,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ],
                 ),
               ),
+              const Divider(height: 18),
+              _HiddenPinSettingsControl(store: store),
             ],
           ),
         ),
@@ -5215,20 +6499,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     label: const Text('Import CSV'),
                   ),
                 ],
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 9),
-        _SettingsCard(
-          title: 'MORE TO EXPLORE',
-          child: Wrap(
-            spacing: 8,
-            children: [
-              OutlinedButton.icon(
-                onPressed: () => _openWrapped(context, store),
-                icon: const Icon(Icons.auto_awesome_rounded, size: 16),
-                label: const Text('Monthly Wrapped'),
               ),
             ],
           ),
@@ -5306,6 +6576,82 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 }
 
+class _HiddenPinSettingsControl extends StatefulWidget {
+  const _HiddenPinSettingsControl({required this.store});
+  final PaisaStore store;
+
+  @override
+  State<_HiddenPinSettingsControl> createState() =>
+      _HiddenPinSettingsControlState();
+}
+
+class _HiddenPinSettingsControlState extends State<_HiddenPinSettingsControl> {
+  late Future<bool> _pinStatus;
+
+  @override
+  void initState() {
+    super.initState();
+    _pinStatus = widget.store.hasPrivacyPin();
+  }
+
+  Future<void> _managePin() async {
+    await _managePrivacyPin(context, widget.store);
+    if (mounted) setState(() => _pinStatus = widget.store.hasPrivacyPin());
+  }
+
+  @override
+  Widget build(BuildContext context) => FutureBuilder<bool>(
+    key: ValueKey(_pinStatus),
+    future: _pinStatus,
+    builder: (context, snapshot) {
+      final ready = snapshot.hasData;
+      final hasPin = snapshot.data == true;
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'A four-digit PIN protects showing hidden ledger entries.',
+            style: TextStyle(
+              color: Theme.of(context).hintColor,
+              fontSize: 10,
+              height: 1.4,
+            ),
+          ),
+          const SizedBox(height: 7),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: ready ? _managePin : null,
+              icon: Icon(
+                hasPin ? Icons.password_rounded : Icons.lock_outline_rounded,
+                size: 16,
+              ),
+              // OutlinedButton.icon already wraps its label in a Flexible, so
+              // a second Flexible here would crash the layout.
+              label: Text(
+                hasPin
+                    ? 'Change hidden transaction PIN'
+                    : 'Create hidden transaction PIN',
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ),
+          Text(
+            'Three incorrect attempts trigger a short pause. Keep the PIN somewhere safe; forgotten PINs cannot be reset without clearing app data.',
+            style: TextStyle(
+              color: Theme.of(context).hintColor,
+              fontSize: 9,
+              height: 1.4,
+            ),
+          ),
+        ],
+      );
+    },
+  );
+}
+
 class _SettingsCard extends StatelessWidget {
   const _SettingsCard({required this.title, required this.child});
   final String title;
@@ -5369,9 +6715,12 @@ class _TransactionEditorState extends State<TransactionEditor> {
   late final TextEditingController _amount;
   late final TextEditingController _description;
   late final TextEditingController _notes;
+  late final TextEditingController _priceItem;
+  late final TextEditingController _pricePlace;
   late String _type, _category;
   late DateTime _date;
   late bool _recurring;
+  late bool _rememberPrice;
   Map<String, dynamic>? _food;
 
   @override
@@ -5383,10 +6732,19 @@ class _TransactionEditorState extends State<TransactionEditor> {
     );
     _description = TextEditingController(text: '${p['description'] ?? ''}');
     _notes = TextEditingController(text: '${p['notes'] ?? ''}');
+    _priceItem = TextEditingController(
+      text: '${p['priceMemoryItem'] ?? p['foodItem'] ?? ''}',
+    );
+    _pricePlace = TextEditingController(
+      text: '${p['priceMemoryPlace'] ?? p['foodShop'] ?? ''}',
+    );
     _type = '${p['type'] ?? 'expense'}';
     _category = '${p['category'] ?? 'Food & snacks'}';
     _date = DateTime.tryParse('${p['date']}') ?? DateTime.now();
     _recurring = p['recurring'] == true;
+    _rememberPrice =
+        p['priceMemoryIgnored'] != true &&
+        (p['priceMemoryItem'] != null || p['foodItem'] != null);
     if (p['foodItem'] != null)
       _food = {...p, 'name': p['foodItem'], 'shop': p['foodShop']};
   }
@@ -5396,6 +6754,8 @@ class _TransactionEditorState extends State<TransactionEditor> {
     _amount.dispose();
     _description.dispose();
     _notes.dispose();
+    _priceItem.dispose();
+    _pricePlace.dispose();
     super.dispose();
   }
 
@@ -5473,6 +6833,9 @@ class _TransactionEditorState extends State<TransactionEditor> {
                     _food = food;
                     _amount.text = '${food['price']}';
                     _description.text = '${food['shop']} · ${food['name']}';
+                    _priceItem.text = '${food['name']}';
+                    _pricePlace.text = '${food['shop']}';
+                    _rememberPrice = true;
                     _category = _foodCategory;
                   });
                 },
@@ -5554,6 +6917,57 @@ class _TransactionEditorState extends State<TransactionEditor> {
               maxLines: 2,
               decoration: const InputDecoration(labelText: 'Notes (optional)'),
             ),
+            if (_type == 'expense') ...[
+              const SizedBox(height: 8),
+              SwitchListTile.adaptive(
+                contentPadding: EdgeInsets.zero,
+                title: const Text(
+                  'Remember this price',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                ),
+                subtitle: Text(
+                  'Keep it in Price Memory with your other logged prices.',
+                  style: TextStyle(
+                    fontSize: 9,
+                    color: Theme.of(context).hintColor,
+                  ),
+                ),
+                value: _rememberPrice,
+                onChanged: (value) => setState(() {
+                  _rememberPrice = value;
+                  if (value && _priceItem.text.trim().isEmpty) {
+                    _priceItem.text = _food == null
+                        ? _description.text.trim()
+                        : '${_food!['name']}';
+                  }
+                  if (value &&
+                      _pricePlace.text.trim().isEmpty &&
+                      _food != null) {
+                    _pricePlace.text = '${_food!['shop']}';
+                  }
+                }),
+              ),
+              if (_rememberPrice) ...[
+                TextField(
+                  controller: _priceItem,
+                  maxLength: 80,
+                  textCapitalization: TextCapitalization.sentences,
+                  decoration: const InputDecoration(
+                    labelText: 'Item or service',
+                    hintText: 'e.g. Colour print, laundry load',
+                  ),
+                ),
+                TextField(
+                  controller: _pricePlace,
+                  maxLength: 80,
+                  textCapitalization: TextCapitalization.words,
+                  decoration: const InputDecoration(
+                    labelText: 'Place (optional)',
+                    hintText: 'Shop, printer, or service',
+                  ),
+                ),
+              ],
+            ],
             const SizedBox(height: 15),
             FilledButton(
               onPressed: _save,
@@ -5568,6 +6982,16 @@ class _TransactionEditorState extends State<TransactionEditor> {
 
   Future<void> _save() async {
     if (!_formKey.currentState!.validate()) return;
+    if (_type == 'expense' &&
+        _rememberPrice &&
+        _priceItem.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Give the remembered price an item name.'),
+        ),
+      );
+      return;
+    }
     final value = <String, dynamic>{
       'type': _type,
       'amount': double.parse(_amount.text),
@@ -5580,12 +7004,56 @@ class _TransactionEditorState extends State<TransactionEditor> {
       'notes': _notes.text.trim(),
       if (_food != null) 'foodItem': _food!['name'],
       if (_food != null) 'foodShop': _food!['shop'],
+      if (_type == 'expense') 'priceMemoryIgnored': !_rememberPrice,
+      if (_type == 'expense' && _rememberPrice)
+        'priceMemoryItem': _priceItem.text.trim(),
+      if (_type == 'expense' && _rememberPrice)
+        'priceMemoryPlace': _pricePlace.text.trim(),
     };
     final id = widget.preset?['id'];
-    if (id == null) {
-      await widget.store.addTransaction(value);
-    } else {
-      await widget.store.updateTransaction('$id', value);
+    double balanceEffect(Map<String, dynamic>? transaction) {
+      if (transaction == null) return 0;
+      final amount = PaisaStore.numberForUi(transaction['amount']);
+      return transaction['type'] == 'income' ? amount : -amount;
+    }
+
+    final previous = id == null
+        ? null
+        : widget.store.transactions.cast<Map<String, dynamic>?>().firstWhere(
+            (transaction) => '${transaction?['id']}' == '$id',
+            orElse: () => null,
+          );
+    final projectedBalance =
+        widget.store.balance - balanceEffect(previous) + balanceEffect(value);
+    if (projectedBalance < -0.000001) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'That is more than your available Pocket. Lower the expense or log income first.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    try {
+      if (id == null) {
+        await widget.store.addTransaction(value);
+      } else {
+        await widget.store.updateTransaction('$id', value);
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Paisa transaction save failed: $error\n$stackTrace');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Could not save this transaction. Check your ledger before trying again.',
+            ),
+          ),
+        );
+      }
+      return;
     }
     if (mounted) {
       Navigator.pop(context);

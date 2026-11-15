@@ -19,10 +19,77 @@ class AllowanceCycle {
   final DateTime payday;
 }
 
+class PrivacyPinAttempt {
+  const PrivacyPinAttempt({
+    required this.success,
+    this.retryAfterSeconds = 0,
+    this.attemptsRemaining = 0,
+  });
+
+  final bool success;
+  final int retryAfterSeconds;
+  final int attemptsRemaining;
+
+  factory PrivacyPinAttempt.fromPlatform(Object? value) {
+    if (value is! Map) {
+      throw const FormatException('Invalid secure PIN response.');
+    }
+    final result = Map<Object?, Object?>.from(value);
+    return PrivacyPinAttempt(
+      success: result['success'] == true,
+      retryAfterSeconds: (result['retryAfterSeconds'] as num? ?? 0).toInt(),
+      attemptsRemaining: (result['attemptsRemaining'] as num? ?? 0).toInt(),
+    );
+  }
+}
+
+/// Cached month-to-date ledger totals so list screens do not re-scan every
+/// transaction during each rebuild.
+class _MonthTotals {
+  const _MonthTotals(
+    this.visibleIncome,
+    this.visibleExpense,
+    this.hiddenExpense,
+  );
+
+  final double visibleIncome;
+  final double visibleExpense;
+  final double hiddenExpense;
+}
+
+/// A grouped view over the user's opted-in/identified expense records.
+/// The underlying transactions remain the source of truth.
+class PriceMemoryEntry {
+  const PriceMemoryEntry({
+    required this.item,
+    required this.place,
+    required this.category,
+    required this.transactions,
+  });
+
+  final String item;
+  final String place;
+  final String category;
+  final List<Map<String, dynamic>> transactions;
+
+  Map<String, dynamic> get latest => transactions.first;
+  Map<String, dynamic>? get previous =>
+      transactions.length > 1 ? transactions[1] : null;
+  String get identity => '${_normalize(item)}|${_normalize(place)}';
+
+  static String _normalize(String value) =>
+      value.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+}
+
 /// The single local source of truth for Paisa. No account or network is needed.
 class PaisaStore extends ChangeNotifier {
   static const _storageKey = 'paisa_flutter_ledger_v1';
+  static const _loreKey = 'paisa_lore_v1';
   static const _legacyChannel = MethodChannel('com.paisaexe.app/legacy');
+  static const _privacyChannel = MethodChannel('com.paisaexe.app/privacy');
+
+  static bool get _usesAndroidSecureStorage =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
   final SharedPreferences _prefs;
   late List<Map<String, dynamic>> transactions;
@@ -41,8 +108,8 @@ class PaisaStore extends ChangeNotifier {
   late bool roast;
   late bool lightMode;
   late String palette;
-  late bool demoSeeded;
-  late bool financeDemoSeeded;
+  Map<String, dynamic> loreState = const <String, dynamic>{};
+  bool privateVaultAvailable = true;
 
   PaisaStore._(this._prefs, Map<String, dynamic> data) {
     final defaults = _defaults();
@@ -70,8 +137,6 @@ class PaisaStore extends ChangeNotifier {
     lightMode = defaults['theme'] == 'light';
     palette = '${defaults['palette'] ?? 'cherry'}';
     if (palette == 'crimson' || palette == 'toxic') palette = 'cherry';
-    demoSeeded = defaults['campusDemoSeeded'] == true;
-    financeDemoSeeded = defaults['financeDemoSeeded'] == true;
   }
 
   static Future<PaisaStore> load() async {
@@ -95,10 +160,50 @@ class PaisaStore extends ChangeNotifier {
       } catch (_) {}
     }
     final store = PaisaStore._(prefs, data);
-    if (!store.demoSeeded && store.transactions.isEmpty) {
-      store._seedDemoTransactions();
+    var vaultLoaded = true;
+    if (_usesAndroidSecureStorage) {
+      String encrypted;
+      try {
+        encrypted =
+            await _privacyChannel.invokeMethod<String>(
+              'loadHiddenTransactions',
+            ) ??
+            '[]';
+      } on PlatformException catch (error) {
+        debugPrint('Paisa private vault load failed: ${error.code}');
+        vaultLoaded = false;
+        encrypted = '[]';
+      }
+      final hidden = _maps(jsonDecode(encrypted));
+      final byId = <String, Map<String, dynamic>>{
+        for (final transaction in store.transactions)
+          if (transaction['id'] != null) '${transaction['id']}': transaction,
+      };
+      for (final transaction in hidden) {
+        final id = transaction['id'];
+        if (id != null) {
+          transaction['hidden'] = true;
+          byId['$id'] = transaction;
+        }
+      }
+      store.transactions = byId.values.toList();
     }
-    if (!store.financeDemoSeeded) store._seedCategoryDemoTransactions();
+    store.privateVaultAvailable = vaultLoaded;
+    // Older builds seeded sample rows. They were always marked demo and were
+    // never real user data, so a normal launch quietly clears them out.
+    store.transactions.removeWhere(
+      (transaction) => transaction['demo'] == true,
+    );
+    final savedLore = prefs.getString(_loreKey);
+    if (savedLore != null) {
+      try {
+        store.loreState = Map<String, dynamic>.from(
+          jsonDecode(savedLore) as Map,
+        );
+      } catch (_) {
+        store.loreState = const <String, dynamic>{};
+      }
+    }
     await store.processDueIncome();
     await store._persist();
     return store;
@@ -138,7 +243,7 @@ class PaisaStore extends ChangeNotifier {
     'palette': 'cherry',
     'messFavorites': <String>[],
     'messTodayMenu': '',
-    'campusFood': _sampleFood(),
+    'campusFood': _campusFood(),
     'foodLikes': <String>[],
     'foodOrders': <String, int>{},
     'recurringIncome': <String, dynamic>{
@@ -150,11 +255,9 @@ class PaisaStore extends ChangeNotifier {
       'anchorDay': 1,
       'description': 'Pocket money',
     },
-    'campusDemoSeeded': false,
-    'financeDemoSeeded': false,
   };
 
-  static List<Map<String, dynamic>> _sampleFood() => [
+  static List<Map<String, dynamic>> _campusFood() => [
     _shop('KC Foods', 'Near KC', [
       ['Aloo paratha', 65],
       ['Paneer paratha', 85],
@@ -201,10 +304,20 @@ class PaisaStore extends ChangeNotifier {
     'items': items.map((item) => {'name': item[0], 'price': item[1]}).toList(),
   };
 
-  Future<void> _persist() async => _prefs.setString(
-    _storageKey,
-    jsonEncode({
-      'transactions': transactions,
+  /// Persists the ledger. The encrypted hidden-transaction vault is written
+  /// before the visible ledger so a failed secure write leaves both copies
+  /// unchanged instead of half-applied.
+  Future<void> _persist({bool persistHiddenTransactions = false}) async {
+    final visibleTransactions = transactions
+        .where((transaction) => transaction['hidden'] != true)
+        .toList();
+    final hiddenTransactions = persistHiddenTransactions
+        ? transactions
+              .where((transaction) => transaction['hidden'] == true)
+              .toList()
+        : null;
+    final data = jsonEncode({
+      'transactions': visibleTransactions,
       'budgets': budgets,
       'openingBalance': openingBalance,
       'monthlyIncome': monthlyIncome,
@@ -220,13 +333,34 @@ class PaisaStore extends ChangeNotifier {
       'foodLikes': foodLikes,
       'foodOrders': foodOrders,
       'recurringIncome': recurringIncome,
-      'campusDemoSeeded': demoSeeded,
-      'financeDemoSeeded': financeDemoSeeded,
-    }),
-  );
+    });
 
-  Future<void> _saveAndNotify() async {
-    await _persist();
+    Future<void> saveVisible() async {
+      await _prefs.setString(_storageKey, data);
+    }
+
+    Future<void> saveHiddenSecurely() async {
+      if (!persistHiddenTransactions) return;
+      if (_usesAndroidSecureStorage) {
+        await _privacyChannel.invokeMethod<void>(
+          'saveHiddenTransactions',
+          jsonEncode(hiddenTransactions),
+        );
+      } else if (hiddenTransactions!.isNotEmpty) {
+        throw UnsupportedError(
+          'Hidden transactions require Android secure storage.',
+        );
+      }
+    }
+
+    await saveHiddenSecurely();
+    await saveVisible();
+  }
+
+  Future<void> _saveAndNotify({bool persistHiddenTransactions = false}) async {
+    await _persist(persistHiddenTransactions: persistHiddenTransactions);
+    _cachedPriceMemoryEntries = null;
+    _cachedMonthTotals = null;
     notifyListeners();
   }
 
@@ -237,6 +371,37 @@ class PaisaStore extends ChangeNotifier {
 
   int get daysUntilPocketMoney =>
       allowanceCycle(today, recurringIncome).daysUntil;
+
+  double get hiddenMonthlyExpenseTotal => _monthTotals.hiddenExpense;
+  double get visibleMonthlyIncomeTotal => _monthTotals.visibleIncome;
+  double get visibleMonthlyExpenseTotal => _monthTotals.visibleExpense;
+
+  _MonthTotals? _cachedMonthTotals;
+  _MonthTotals get _monthTotals => _cachedMonthTotals ??= _buildMonthTotals();
+
+  _MonthTotals _buildMonthTotals() {
+    final now = today;
+    var visibleIncome = 0.0;
+    var visibleExpense = 0.0;
+    var hiddenExpense = 0.0;
+    for (final transaction in transactions) {
+      final date = DateTime.tryParse('${transaction['date']}');
+      if (date == null || date.year != now.year || date.month != now.month) {
+        continue;
+      }
+      final amount = _number(transaction['amount']);
+      if (transaction['type'] == 'income' && transaction['hidden'] != true) {
+        visibleIncome += amount;
+      } else if (transaction['type'] == 'expense') {
+        if (transaction['hidden'] == true) {
+          hiddenExpense += amount;
+        } else {
+          visibleExpense += amount;
+        }
+      }
+    }
+    return _MonthTotals(visibleIncome, visibleExpense, hiddenExpense);
+  }
 
   static AllowanceCycle allowanceCycle(
     DateTime value,
@@ -296,7 +461,9 @@ class PaisaStore extends ChangeNotifier {
     final elapsed = date.difference(previousPayday).inDays;
     return AllowanceCycle(
       isPayday: isPayday,
-      progress: isPayday ? 0 : (elapsed / (cycleDays - 1)).clamp(0.0, 1.0),
+      progress: isPayday
+          ? 0
+          : ((elapsed / (cycleDays - 1)).clamp(0.0, 1.0) as num).toDouble(),
       daysUntil: isPayday ? 0 : nextPayday.difference(date).inDays,
       payday: isPayday ? thisMonth : nextPayday,
     );
@@ -313,17 +480,206 @@ class PaisaStore extends ChangeNotifier {
           .fold<double>(0, (sum, t) => sum + _number(t['amount']));
 
   double categorySpend(String category) => monthTransactions
-      .where((t) => t['category'] == category && t['type'] == 'expense')
+      .where(
+        (t) =>
+            t['hidden'] != true &&
+            t['category'] == category &&
+            t['type'] == 'expense',
+      )
       .fold<double>(0, (sum, t) => sum + _number(t['amount']));
 
   double get monthlyBudget => budgets.values.fold<double>(0, (a, b) => a + b);
   double get dailyPace =>
       balance > 0 ? balance / daysUntilPocketMoney.clamp(1, 365) : 0;
-  List<Map<String, dynamic>> get sortedTransactions {
-    final list = [...transactions];
-    list.sort((a, b) => '${b['date']}'.compareTo('${a['date']}'));
+  List<Map<String, dynamic>> get sortedTransactions =>
+      sortTransactions(transactions);
+
+  static List<Map<String, dynamic>> sortTransactions(
+    Iterable<Map<String, dynamic>> source,
+  ) {
+    final list = [...source];
+    list.sort((a, b) {
+      final dateOrder = '${b['date']}'.compareTo('${a['date']}');
+      if (dateOrder != 0) return dateOrder;
+      return '${b['created'] ?? b['id']}'.compareTo(
+        '${a['created'] ?? a['id']}',
+      );
+    });
     return list;
   }
+
+  List<PriceMemoryEntry>? _cachedPriceMemoryEntries;
+  List<PriceMemoryEntry> get priceMemoryEntries =>
+      _cachedPriceMemoryEntries ??= buildPriceMemoryEntries(transactions);
+
+  List<Map<String, dynamic>> get hiddenTransactions => transactions
+      .where((transaction) => transaction['hidden'] == true)
+      .toList();
+
+  Future<bool> hasPrivacyPin() async {
+    if (!_usesAndroidSecureStorage) return false;
+    return await _privacyChannel.invokeMethod<bool>('hasPrivacyPin') ?? false;
+  }
+
+  Future<void> setPrivacyPin(String pin) async {
+    if (!_usesAndroidSecureStorage) {
+      throw UnsupportedError('Privacy PINs are available on Android.');
+    }
+    await _privacyChannel.invokeMethod<void>('setPrivacyPin', {'pin': pin});
+  }
+
+  Future<PrivacyPinAttempt> verifyPrivacyPin(String pin) async {
+    if (!_usesAndroidSecureStorage) {
+      throw UnsupportedError('Privacy PINs are available on Android.');
+    }
+    final result = await _privacyChannel.invokeMethod<Object?>(
+      'verifyPrivacyPin',
+      {'pin': pin},
+    );
+    return PrivacyPinAttempt.fromPlatform(result);
+  }
+
+  Future<PrivacyPinAttempt> changePrivacyPin(
+    String oldPin,
+    String newPin,
+  ) async {
+    if (!_usesAndroidSecureStorage) {
+      throw UnsupportedError('Privacy PINs are available on Android.');
+    }
+    final result = await _privacyChannel.invokeMethod<Object?>(
+      'changePrivacyPin',
+      {'oldPin': oldPin, 'newPin': newPin},
+    );
+    return PrivacyPinAttempt.fromPlatform(result);
+  }
+
+  Future<void> setTransactionHidden(String id, bool hidden) async {
+    final index = transactions.indexWhere(
+      (transaction) => '${transaction['id']}' == id,
+    );
+    if (index < 0 || (transactions[index]['hidden'] == true) == hidden) return;
+    if (!privateVaultAvailable) {
+      throw StateError(
+        'The encrypted hidden-transaction vault could not be opened. '
+        'Restart the app or contact support; protected data was left intact.',
+      );
+    }
+    final transaction = transactions[index];
+    if (hidden && !_usesAndroidSecureStorage) {
+      throw UnsupportedError(
+        'Hidden transactions require Android secure storage.',
+      );
+    }
+    final previousFoodOrders = Map<String, int>.from(foodOrders);
+    transaction['hidden'] = hidden;
+    final foodItem = transaction['foodItem'];
+    if (foodItem != null) {
+      final name = '$foodItem';
+      final count = (foodOrders[name] ?? 0) + (hidden ? -1 : 1);
+      if (count <= 0) {
+        foodOrders.remove(name);
+      } else {
+        foodOrders[name] = count;
+      }
+    }
+    try {
+      await _persist(persistHiddenTransactions: true);
+    } catch (_) {
+      transaction['hidden'] = !hidden;
+      foodOrders
+        ..clear()
+        ..addAll(previousFoodOrders);
+      try {
+        await _persist(persistHiddenTransactions: true);
+      } catch (_) {
+        // Keep the original failure; the in-memory transaction is restored.
+      }
+      rethrow;
+    }
+    _cachedPriceMemoryEntries = null;
+    _cachedMonthTotals = null;
+    notifyListeners();
+  }
+
+  static List<PriceMemoryEntry> buildPriceMemoryEntries(
+    Iterable<Map<String, dynamic>> source,
+  ) {
+    final grouped = <String, List<Map<String, dynamic>>>{};
+    final labels = <String, (String, String)>{};
+    for (final transaction in source) {
+      if (transaction['type'] != 'expense' ||
+          transaction['hidden'] == true ||
+          transaction['demo'] == true ||
+          transaction['priceMemoryIgnored'] == true ||
+          _number(transaction['amount']) <= 0 ||
+          DateTime.tryParse('${transaction['date']}') == null) {
+        continue;
+      }
+      final item =
+          '${transaction['priceMemoryItem'] ?? transaction['foodItem'] ?? ''}'
+              .trim();
+      final place =
+          '${transaction['priceMemoryPlace'] ?? transaction['foodShop'] ?? ''}'
+              .trim();
+      if (item.isEmpty) continue;
+      final identity =
+          '${_priceMemoryNormalize(item)}|${_priceMemoryNormalize(place)}';
+      grouped.putIfAbsent(identity, () => []).add(transaction);
+      labels.putIfAbsent(identity, () => (item, place));
+    }
+
+    final entries = <PriceMemoryEntry>[];
+    for (final group in grouped.entries) {
+      group.value.sort((a, b) => '${b['date']}'.compareTo('${a['date']}'));
+      final (item, place) = labels[group.key]!;
+      entries.add(
+        PriceMemoryEntry(
+          item: item,
+          place: place,
+          category: '${group.value.first['category'] ?? 'Miscellaneous'}',
+          transactions: List.unmodifiable(group.value),
+        ),
+      );
+    }
+    entries.sort(
+      (a, b) => '${b.latest['date']}'.compareTo('${a.latest['date']}'),
+    );
+    return entries;
+  }
+
+  Future<void> renamePriceMemoryEntry(
+    Iterable<String> transactionIds, {
+    required String item,
+    required String place,
+  }) async {
+    final ids = transactionIds.toSet();
+    final cleanItem = item.trim();
+    final cleanPlace = place.trim();
+    if (cleanItem.isEmpty || cleanItem.length > 80 || cleanPlace.length > 80) {
+      return;
+    }
+    for (final transaction in transactions) {
+      if (ids.contains('${transaction['id']}')) {
+        transaction['priceMemoryItem'] = cleanItem;
+        transaction['priceMemoryPlace'] = cleanPlace;
+        transaction['priceMemoryIgnored'] = false;
+      }
+    }
+    await _saveAndNotify();
+  }
+
+  Future<void> removePriceMemoryEntry(Iterable<String> transactionIds) async {
+    final ids = transactionIds.toSet();
+    for (final transaction in transactions) {
+      if (ids.contains('${transaction['id']}')) {
+        transaction['priceMemoryIgnored'] = true;
+      }
+    }
+    await _saveAndNotify();
+  }
+
+  static String _priceMemoryNormalize(String value) =>
+      value.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
 
   Future<void> addTransaction(Map<String, dynamic> value) async {
     final t = Map<String, dynamic>.from(value);
@@ -337,19 +693,28 @@ class PaisaStore extends ChangeNotifier {
       foodOrders['${t['foodItem']}'] =
           (foodOrders['${t['foodItem']}'] ?? 0) + 1;
     }
-    await _saveAndNotify();
+    await _saveAndNotify(persistHiddenTransactions: t['hidden'] == true);
   }
 
   Future<void> updateTransaction(String id, Map<String, dynamic> value) async {
     final index = transactions.indexWhere((t) => t['id'] == id);
     if (index < 0) return;
+    final wasHidden = transactions[index]['hidden'] == true;
     transactions[index] = {...transactions[index], ...value};
-    await _saveAndNotify();
+    final isHidden = transactions[index]['hidden'] == true;
+    await _persist(persistHiddenTransactions: wasHidden || isHidden);
+    _cachedPriceMemoryEntries = null;
+    _cachedMonthTotals = null;
+    notifyListeners();
   }
 
   Future<void> deleteTransaction(String id) async {
+    final wasHidden = transactions.any(
+      (transaction) =>
+          '${transaction['id']}' == id && transaction['hidden'] == true,
+    );
     transactions.removeWhere((t) => t['id'] == id);
-    await _saveAndNotify();
+    await _saveAndNotify(persistHiddenTransactions: wasHidden);
   }
 
   Future<void> toggleFoodLike(String name) async {
@@ -472,6 +837,13 @@ class PaisaStore extends ChangeNotifier {
     }
   }
 
+  /// Persists the story's small state map separately from the ledger so a
+  /// scroll update never re-encodes every transaction.
+  Future<void> saveLoreState(Map<String, dynamic> next) async {
+    loreState = Map<String, dynamic>.unmodifiable(next);
+    await _prefs.setString(_loreKey, jsonEncode(next));
+  }
+
   Future<void> reset() async {
     final fresh = PaisaStore._(_prefs, _defaults());
     transactions = fresh.transactions;
@@ -490,108 +862,8 @@ class PaisaStore extends ChangeNotifier {
     roast = fresh.roast;
     lightMode = fresh.lightMode;
     palette = fresh.palette;
-    demoSeeded = true;
-    financeDemoSeeded = true;
-    await _saveAndNotify();
-  }
-
-  void _seedCategoryDemoTransactions() {
-    final samples = <List<Object>>[
-      ['expense', 185, 'DEMO · Late-night campus delivery', 'Food delivery', 1],
-      ['expense', 48, 'DEMO · Auto to North Gate', 'Transport', 3],
-      ['expense', 32, 'DEMO · Lab notes printout', 'College & printing', 5],
-      ['expense', 329, 'DEMO · Charging cable', 'Shopping', 7],
-      ['expense', 119, 'DEMO · Music plan', 'Subscriptions', 9],
-      ['expense', 210, 'DEMO · Friday game night', 'Social & fun', 11],
-      ['expense', 95, 'DEMO · Face wash', 'Personal care', 14],
-      ['expense', 68, 'DEMO · Laundry token', 'Miscellaneous', 17],
-      ['expense', 42, 'DEMO · Evening chai', 'Food & snacks', 20],
-      ['income', 2400, 'DEMO · Pocket money', 'Income', 8],
-      ['income', 650, 'DEMO · Shared notes refund', 'Income', 19],
-    ];
-    final now = today;
-    for (final item in samples) {
-      final day = (now.day - (item[4] as int)).clamp(1, now.day).toInt();
-      final date = DateTime(now.year, now.month, day);
-      transactions.add({
-        'id':
-            'demo-category-${date.millisecondsSinceEpoch}-${transactions.length}',
-        'created': date.toIso8601String(),
-        'date': DateFormat('yyyy-MM-dd').format(date),
-        'type': item[0],
-        'amount': item[1],
-        'description': item[2],
-        'category': item[3],
-        'payment': 'UPI',
-        'recurring': false,
-        'notes': 'Sample transaction for testing · safe to delete',
-        'demo': true,
-      });
-    }
-    financeDemoSeeded = true;
-  }
-
-  void _seedDemoTransactions() {
-    final samples = <List<Object>>[
-      ['expense', 65, 'DEMO · KC Foods · Aloo paratha', 'Food & snacks', 0],
-      ['expense', 85, 'DEMO · KC Foods · Paneer paratha', 'Food & snacks', 1],
-      ['expense', 55, 'DEMO · KC Foods · Masala Maggi', 'Food & snacks', 2],
-      ['expense', 25, 'DEMO · Darling Bakery · Veg puff', 'Food & snacks', 3],
-      [
-        'expense',
-        65,
-        'DEMO · Darling Bakery · Paneer roll',
-        'Food & snacks',
-        4,
-      ],
-      ['expense', 90, 'DEMO · Foodys · Veg burger', 'Food & snacks', 5],
-      ['expense', 80, 'DEMO · Foodys · Peri peri fries', 'Food & snacks', 6],
-      ['expense', 100, 'DEMO · Sai Tiffins · Masala dosa', 'Food & snacks', 7],
-      ['expense', 45, 'DEMO · Sai Tiffins · Idli', 'Food & snacks', 8],
-      [
-        'expense',
-        100,
-        'DEMO · Waffletime · Classic waffle',
-        'Food & snacks',
-        9,
-      ],
-      ['expense', 60, 'DEMO · Foodys · Lemon iced tea', 'Food & snacks', 10],
-      [
-        'expense',
-        75,
-        'DEMO · KC Foods · Grilled sandwich',
-        'Food & snacks',
-        11,
-      ],
-      [
-        'expense',
-        35,
-        'DEMO · Sai Tiffins · Filter coffee',
-        'Food & snacks',
-        12,
-      ],
-      ['expense', 55, 'DEMO · Darling Bakery · Brownie', 'Food & snacks', 13],
-      ['expense', 110, 'DEMO · Sai Tiffins · Paneer dosa', 'Food & snacks', 14],
-      ['income', 1500, 'DEMO · Pocket money', 'Income', 15],
-      ['income', 1000, 'DEMO · Family transfer', 'Income', 17],
-      ['income', 2000, 'DEMO · Pocket money', 'Income', 20],
-    ];
-    for (final item in samples) {
-      final date = today.subtract(Duration(days: item[4] as int));
-      transactions.add({
-        'id': 'demo-${date.millisecondsSinceEpoch}-${transactions.length}',
-        'created': date.toIso8601String(),
-        'date': DateFormat('yyyy-MM-dd').format(date),
-        'type': item[0],
-        'amount': item[1],
-        'description': item[2],
-        'category': item[3],
-        'payment': 'UPI',
-        'recurring': false,
-        'notes': 'Sample transaction for testing · safe to delete',
-        'demo': true,
-      });
-    }
-    demoSeeded = true;
+    loreState = const <String, dynamic>{};
+    await _prefs.remove(_loreKey);
+    await _saveAndNotify(persistHiddenTransactions: true);
   }
 }

@@ -46,3 +46,13 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# Freebuff / AI tooling (local only)
+.freebuff/
+tool/
+
+# Flutter plugin deps (generated)
+.flutter-plugins-dependencies
+
+# Logs
+*.log

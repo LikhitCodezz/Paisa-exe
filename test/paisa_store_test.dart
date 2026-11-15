@@ -55,7 +55,7 @@ void main() {
       expect(weekly.daysUntil, 4);
       expect(fortnightly.payday, DateTime(2026, 5, 1));
       expect(fortnightly.daysUntil, 1);
-      expect(fortnightly.progress, closeTo(12 / 13, 1e-12));
+      expect(fortnightly.progress, 1);
     });
   });
 }

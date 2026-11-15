@@ -2,6 +2,8 @@
     <application
         android:label="Paisa.exe"
         android:name="${applicationName}"
+        android:fullBackupContent="@xml/paisa_backup_rules"
+        android:dataExtractionRules="@xml/paisa_data_extraction_rules"
         android:icon="@mipmap/ic_launcher">
         <activity
             android:name=".MainActivity"
