@@ -56,3 +56,6 @@ tool/
 
 # Logs
 *.log
+
+# Generated Gradle error logs
+android/gradle-error.txt

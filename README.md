@@ -39,6 +39,16 @@ No accounts. No cloud. No ads. Your data lives on your phone and nowhere else.
 
 ---
 
+## Screenshots
+
+| Home | Activity | Campus |
+|---|---|---|
+| ![Home screen](screenshots/home.png) | ![Activity screen](screenshots/activity.png) | ![Campus screen](screenshots/campus.png) |
+
+| Budgets | Insights | Settings (More) |
+|---|---|---|
+| ![Budgets screen](screenshots/budgets.png) | ![Insights screen](screenshots/insights.png) | ![Settings screen](screenshots/settings.png) |
+
 ## Screens and flow
 
 1. Open the app and set up your starting balance and recurring allowance.
